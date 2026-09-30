@@ -31,22 +31,22 @@ var (
 // Dataset stores examples in row-major order. Inputs has Examples*InputSize
 // values and Targets has Examples*OutputSize values.
 type Dataset struct {
-	Examples uint32
-	Inputs   []float32
-	Targets  []float32
+	Examples uint32    `json:"examples"`
+	Inputs   []float32 `json:"inputs"`
+	Targets  []float32 `json:"targets"`
 }
 
 // JobSpec contains every value that affects canonical execution.
 type JobSpec struct {
-	Version      uint16
-	Seed         uint64
-	Steps        uint64
-	InputSize    uint32
-	HiddenSize   uint32
-	OutputSize   uint32
-	BatchSize    uint32
-	LearningRate float32
-	Dataset      Dataset
+	Version      uint16  `json:"version"`
+	Seed         uint64  `json:"seed"`
+	Steps        uint64  `json:"steps"`
+	InputSize    uint32  `json:"input_size"`
+	HiddenSize   uint32  `json:"hidden_size"`
+	OutputSize   uint32  `json:"output_size"`
+	BatchSize    uint32  `json:"batch_size"`
+	LearningRate float32 `json:"learning_rate"`
+	Dataset      Dataset `json:"dataset"`
 }
 
 // Parameters are stored in canonical W1, B1, W2, B2 order. Matrices are
