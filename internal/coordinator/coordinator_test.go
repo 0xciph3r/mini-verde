@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -88,7 +89,7 @@ func TestDifferentRootsWithSameFinalStateAreAccepted(t *testing.T) {
 	}
 }
 
-func TestDifferentFinalHashesNeedDispute(t *testing.T) {
+func TestAdvertisedFinalHashOutsideRootIsBadOpening(t *testing.T) {
 	limits := protocol.DefaultLimits()
 	workerA, serverA := startWorker(t, "worker-a", limits, mutateExecuteFinalHash)
 	workerB, serverB := startWorker(t, "worker-b", limits, nil)
@@ -97,11 +98,18 @@ func TestDifferentFinalHashesNeedDispute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
-	if result.Status != coordinator.NeedsDispute {
-		t.Fatalf("Run() status = %q, want %q", result.Status, coordinator.NeedsDispute)
+	if result.Status != coordinator.Accepted {
+		t.Fatalf("Run() status = %q, want %q", result.Status, coordinator.Accepted)
 	}
-	if workerA.ActiveAttempts() != 1 || workerB.ActiveAttempts() != 1 {
-		t.Fatal("disputed attempts were closed")
+	if len(result.Findings) != 1 || result.Findings[0].WorkerID != "worker-a" ||
+		result.Findings[0].Verdict != protocol.VerdictBadOpening {
+		t.Fatalf("findings = %+v, want worker-a BadOpening", result.Findings)
+	}
+	if result.Acceptance == nil || result.Acceptance.Kind != coordinator.BasisLoserProvenFaulty {
+		t.Fatalf("acceptance basis = %+v", result.Acceptance)
+	}
+	if workerA.ActiveAttempts() != 0 || workerB.ActiveAttempts() != 0 {
+		t.Fatal("resolved attempts were not closed")
 	}
 }
 
@@ -119,6 +127,97 @@ func TestBadPreferredStateFallsBackToSecondWorker(t *testing.T) {
 	}
 	if len(result.Findings) != 1 || result.Findings[0].WorkerID != "worker-a" || result.Findings[0].Verdict != "BadState" {
 		t.Fatalf("Run() findings = %+v, want worker-a BadState", result.Findings)
+	}
+}
+
+func TestBadStateFallbackAlsoRequiresFinalRootOpening(t *testing.T) {
+	limits := protocol.DefaultLimits()
+	_, serverA := startWorker(t, "worker-a", limits, mutateFinalState)
+	_, serverB := startWorker(t, "worker-b", limits, mutateExecuteRoot)
+	client := mustCoordinator(t, serverA.URL, serverB.URL, limits)
+	result, err := client.Run(context.Background(), smallSpec(1))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.Status != coordinator.Rejected || len(result.Findings) != 2 {
+		t.Fatalf("result = %+v", result)
+	}
+	if result.Findings[0].Verdict != protocol.VerdictBadState ||
+		result.Findings[1].Verdict != protocol.VerdictBadOpening {
+		t.Fatalf("findings = %+v", result.Findings)
+	}
+}
+
+func TestBothBadFinalStatesAreRejectedWithoutLosingVerdicts(t *testing.T) {
+	limits := protocol.DefaultLimits()
+	workerA, serverA := startWorker(t, "worker-a", limits, mutateFinalState)
+	workerB, serverB := startWorker(t, "worker-b", limits, mutateFinalState)
+	client := mustCoordinator(t, serverA.URL, serverB.URL, limits)
+	result, err := client.Run(context.Background(), smallSpec(1))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.Status != coordinator.Rejected {
+		t.Fatalf("Run() status = %q, want %q", result.Status, coordinator.Rejected)
+	}
+	if len(result.Findings) != 2 {
+		t.Fatalf("findings = %+v, want two BadState verdicts", result.Findings)
+	}
+	for i, finding := range result.Findings {
+		if finding.WorkerID != []string{"worker-a", "worker-b"}[i] || finding.Verdict != protocol.VerdictBadState {
+			t.Fatalf("finding %d = %+v", i, finding)
+		}
+	}
+	if workerA.ActiveAttempts() != 0 || workerB.ActiveAttempts() != 0 {
+		t.Fatal("terminally rejected attempts were not closed")
+	}
+}
+
+func TestFinalStateDeadlineIsUnresolvedAndDoesNotBlameWorkers(t *testing.T) {
+	limits := protocol.DefaultLimits()
+	workerA, serverA := startWorker(t, "worker-a", limits, stallResponse(protocol.FinalStatePath))
+	workerB, serverB := startWorker(t, "worker-b", limits, stallResponse(protocol.FinalStatePath))
+	config := coordinator.DefaultConfig()
+	config.Limits = limits
+	config.RequestTimeout = 40 * time.Millisecond
+	config.JobTimeout = time.Second
+	client := mustCoordinatorWithConfig(t, serverA.URL, serverB.URL, config)
+
+	started := time.Now()
+	result, err := client.Run(context.Background(), smallSpec(1))
+	if err == nil {
+		t.Fatal("Run() succeeded despite workers that never answer final-state requests")
+	}
+	if time.Since(started) > 500*time.Millisecond {
+		t.Fatalf("Run() exceeded configured request deadlines: %v", time.Since(started))
+	}
+	if len(result.Findings) != 0 {
+		t.Fatalf("deadline produced worker verdicts: %+v", result.Findings)
+	}
+	if workerA.ActiveAttempts() != 1 || workerB.ActiveAttempts() != 1 {
+		t.Fatal("unresolved deadline did not retain both attempts")
+	}
+}
+
+func TestOverallJobDeadlineBoundsAStalledExecute(t *testing.T) {
+	limits := protocol.DefaultLimits()
+	workerA, serverA := startWorker(t, "worker-a", limits, stallResponse(protocol.ExecutePath))
+	workerB, serverB := startWorker(t, "worker-b", limits, stallResponse(protocol.ExecutePath))
+	config := coordinator.DefaultConfig()
+	config.Limits = limits
+	config.RequestTimeout = time.Second
+	config.JobTimeout = 40 * time.Millisecond
+	client := mustCoordinatorWithConfig(t, serverA.URL, serverB.URL, config)
+
+	result, err := client.Run(context.Background(), smallSpec(1))
+	if err == nil {
+		t.Fatal("Run() succeeded despite stalled execute responses")
+	}
+	if len(result.Findings) != 0 {
+		t.Fatalf("job deadline produced worker verdicts: %+v", result.Findings)
+	}
+	if workerA.ActiveAttempts() != 1 || workerB.ActiveAttempts() != 1 {
+		t.Fatal("unresolved job deadline did not retain both attempts")
 	}
 }
 
@@ -141,6 +240,60 @@ func TestCoordinatorEnforcesAdmissionLimitsBeforeDispatch(t *testing.T) {
 	spec.Steps = limits.MaxSteps + 1
 	if _, err := client.Run(context.Background(), spec); err == nil {
 		t.Fatal("Run() accepted a job above the step limit")
+	}
+}
+
+func TestCoordinatorRejectsBatchWorkAndRetentionBeforeDispatch(t *testing.T) {
+	tests := []struct {
+		name   string
+		limits func(protocol.Limits) protocol.Limits
+		spec   func() job.JobSpec
+	}{
+		{
+			name: "batch",
+			limits: func(limits protocol.Limits) protocol.Limits {
+				limits.MaxBatchSize = 1
+				return limits
+			},
+			spec: func() job.JobSpec { return smallSpec(1) },
+		},
+		{
+			name: "work",
+			limits: func(limits protocol.Limits) protocol.Limits {
+				limits.MaxWork = 1
+				return limits
+			},
+			spec: func() job.JobSpec { return smallSpec(1) },
+		},
+		{
+			name: "retained states",
+			limits: func(limits protocol.Limits) protocol.Limits {
+				limits.MaxRetainedStateBytes = 1
+				return limits
+			},
+			spec: func() job.JobSpec { return smallSpec(1) },
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			limits := tc.limits(protocol.DefaultLimits())
+			var dispatches atomic.Int64
+			count := func(next http.Handler) http.Handler {
+				return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+					dispatches.Add(1)
+					next.ServeHTTP(response, request)
+				})
+			}
+			_, serverA := startWorker(t, "worker-a", limits, count)
+			_, serverB := startWorker(t, "worker-b", limits, count)
+			client := mustCoordinator(t, serverA.URL, serverB.URL, limits)
+			if _, err := client.Run(context.Background(), tc.spec()); err == nil {
+				t.Fatalf("Run() accepted a job above the %s limit", tc.name)
+			}
+			if got := dispatches.Load(); got != 0 {
+				t.Fatalf("dispatches = %d, want 0", got)
+			}
+		})
 	}
 }
 
@@ -212,6 +365,18 @@ func mustCoordinator(t *testing.T, workerAURL, workerBURL string, limits protoco
 	return client
 }
 
+func mustCoordinatorWithConfig(t *testing.T, workerAURL, workerBURL string, config coordinator.Config) *coordinator.Coordinator {
+	t.Helper()
+	client, err := coordinator.NewWithConfig([]coordinator.Endpoint{
+		{ID: "worker-a", URL: workerAURL},
+		{ID: "worker-b", URL: workerBURL},
+	}, &http.Client{}, config)
+	if err != nil {
+		t.Fatalf("coordinator.NewWithConfig() error = %v", err)
+	}
+	return client
+}
+
 type overlapGate struct {
 	mu       sync.Mutex
 	arrivals int
@@ -275,6 +440,34 @@ func mutateFinalState(next http.Handler) http.Handler {
 	})
 }
 
+func mutateIndexedState(next http.Handler) http.Handler {
+	return mutateResponse(next, protocol.StatePath, func(response any) {
+		message := response.(*protocol.StateResponse)
+		message.State[0] ^= 1
+	})
+}
+
+func mutateStepHashProof(next http.Handler) http.Handler {
+	return mutateResponse(next, protocol.StepHashPath, func(response any) {
+		message := response.(*protocol.StepHashResponse)
+		message.Proof.Siblings[0] = flipHex(message.Proof.Siblings[0])
+	})
+}
+
+func stallResponse(path string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+			if request.URL.Path != path {
+				next.ServeHTTP(response, request)
+				return
+			}
+			recorder := httptest.NewRecorder()
+			next.ServeHTTP(recorder, request)
+			<-request.Context().Done()
+		})
+	}
+}
+
 func mutateResponse(next http.Handler, path string, mutate func(any)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != path {
@@ -288,9 +481,14 @@ func mutateResponse(next http.Handler, path string, mutate func(any)) http.Handl
 			return
 		}
 		var message any
-		if path == protocol.ExecutePath {
+		switch path {
+		case protocol.ExecutePath:
 			message = &protocol.ExecuteResponse{}
-		} else {
+		case protocol.StepHashPath:
+			message = &protocol.StepHashResponse{}
+		case protocol.StatePath:
+			message = &protocol.StateResponse{}
+		default:
 			message = &protocol.FinalStateResponse{}
 		}
 		if err := json.Unmarshal(recorder.Body.Bytes(), message); err != nil {

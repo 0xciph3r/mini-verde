@@ -31,12 +31,15 @@ func (values *workerFlags) Set(value string) error {
 }
 
 type output struct {
-	Status         coordinator.Status    `json:"status"`
-	JobID          string                `json:"job_id"`
-	FinalStateHash string                `json:"final_state_hash,omitempty"`
-	Roots          []string              `json:"roots"`
-	Findings       []coordinator.Finding `json:"findings,omitempty"`
-	CleanupErrors  []string              `json:"cleanup_errors,omitempty"`
+	Status         coordinator.Status           `json:"status"`
+	JobID          string                       `json:"job_id"`
+	FinalStateHash string                       `json:"final_state_hash,omitempty"`
+	Roots          []string                     `json:"roots"`
+	Findings       []coordinator.Finding        `json:"findings,omitempty"`
+	OverallVerdict string                       `json:"overall_verdict,omitempty"`
+	Acceptance     *coordinator.AcceptanceBasis `json:"acceptance,omitempty"`
+	Dispute        *coordinator.DisputeSummary  `json:"dispute,omitempty"`
+	CleanupErrors  []string                     `json:"cleanup_errors,omitempty"`
 }
 
 func main() {
@@ -49,6 +52,8 @@ func main() {
 func run() error {
 	flags := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
 	jobPath := flags.String("job", "", "path to a JSON job specification")
+	requestTimeout := flags.Duration("request-timeout", coordinator.DefaultRequestTimeout, "deadline for each worker HTTP call")
+	jobTimeout := flags.Duration("job-timeout", coordinator.DefaultJobTimeout, "overall job deadline")
 	var workers workerFlags
 	flags.Var(&workers, "worker", "worker endpoint as id=http://host:port (repeat twice)")
 	if err := flags.Parse(os.Args[1:]); err != nil {
@@ -68,7 +73,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	client, err := coordinator.New(endpoints, &http.Client{}, protocol.DefaultLimits())
+	config := coordinator.DefaultConfig()
+	config.Limits = protocol.DefaultLimits()
+	config.RequestTimeout = *requestTimeout
+	config.JobTimeout = *jobTimeout
+	client, err := coordinator.NewWithConfig(endpoints, &http.Client{}, config)
 	if err != nil {
 		return err
 	}
@@ -80,11 +89,14 @@ func run() error {
 	}
 
 	report := output{
-		Status:        result.Status,
-		JobID:         protocol.EncodeDigest(result.JobID),
-		Roots:         make([]string, len(result.Commitments)),
-		Findings:      result.Findings,
-		CleanupErrors: result.CleanupErrors,
+		Status:         result.Status,
+		JobID:          protocol.EncodeDigest(result.JobID),
+		Roots:          make([]string, len(result.Commitments)),
+		Findings:       result.Findings,
+		OverallVerdict: result.OverallVerdict,
+		Acceptance:     result.Acceptance,
+		Dispute:        result.Dispute,
+		CleanupErrors:  result.CleanupErrors,
 	}
 	if result.Status == coordinator.Accepted {
 		report.FinalStateHash = protocol.EncodeDigest(result.StateHash)

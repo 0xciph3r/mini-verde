@@ -49,12 +49,7 @@ func run() error {
 	}
 	defer listener.Close()
 
-	server := &http.Server{
-		Handler:           handler,
-		ReadHeaderTimeout: 2 * time.Second,
-		IdleTimeout:       30 * time.Second,
-		MaxHeaderBytes:    16 << 10,
-	}
+	server := newHTTPServer(handler)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	serveErrors := make(chan error, 1)
@@ -74,6 +69,19 @@ func run() error {
 			return fmt.Errorf("shutdown: %w", err)
 		}
 		return nil
+	}
+}
+
+func newHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 2 * time.Second,
+		// Execution duration is governed by the coordinator's configurable
+		// request and job contexts. A server write deadline must not truncate a
+		// valid job before those deadlines.
+		WriteTimeout:   0,
+		IdleTimeout:    30 * time.Second,
+		MaxHeaderBytes: 16 << 10,
 	}
 }
 

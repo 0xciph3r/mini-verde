@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/0xciph3r/mini-verde/internal/job"
 	"github.com/0xciph3r/mini-verde/internal/protocol"
@@ -26,9 +27,44 @@ import (
 type Status string
 
 const (
-	Accepted     Status = "Accepted"
-	NeedsDispute Status = "NeedsDispute"
+	Accepted Status = "Accepted"
+	Rejected Status = "Rejected"
+
+	BasisFinalStateAgreement = "FinalStateAgreement"
+	BasisLoserProvenFaulty   = "LoserProvenFaulty"
 )
+
+var errInvalidWorkerResponse = errors.New("invalid worker response")
+
+const (
+	DefaultRequestTimeout = 30 * time.Second
+	DefaultJobTimeout     = 2 * time.Minute
+)
+
+// Config contains coordinator-owned resource and deadline policy.
+type Config struct {
+	Limits         protocol.Limits
+	RequestTimeout time.Duration
+	JobTimeout     time.Duration
+}
+
+func DefaultConfig() Config {
+	return Config{
+		Limits:         protocol.DefaultLimits(),
+		RequestTimeout: DefaultRequestTimeout,
+		JobTimeout:     DefaultJobTimeout,
+	}
+}
+
+func (config Config) validate() error {
+	if err := config.Limits.Validate(); err != nil {
+		return err
+	}
+	if config.RequestTimeout <= 0 || config.JobTimeout <= 0 {
+		return fmt.Errorf("request and job timeouts must be positive")
+	}
+	return nil
+}
 
 // Endpoint identifies one worker and its loopback HTTP address.
 type Endpoint struct {
@@ -46,38 +82,73 @@ type Commitment struct {
 
 // Finding records a protocol verdict produced while validating a worker.
 type Finding struct {
-	WorkerID string
-	Verdict  string
+	WorkerID string  `json:"worker_id"`
+	Verdict  string  `json:"verdict"`
+	Step     *uint64 `json:"step,omitempty"`
+}
+
+type AcceptanceBasis struct {
+	Kind         string `json:"kind"`
+	FaultyWorker string `json:"faulty_worker,omitempty"`
+	Verdict      string `json:"verdict,omitempty"`
+}
+
+type DisputeCost struct {
+	StepHashRounds               uint64            `json:"step_hash_rounds"`
+	BisectionRounds              uint64            `json:"bisection_rounds"`
+	WorkerRecomputeStepsExpected map[string]uint64 `json:"worker_recompute_steps_expected_from_schedule"`
+	RefereeSteps                 uint64            `json:"referee_steps"`
+	LogicalRounds                uint64            `json:"logical_rounds"`
+}
+
+type DisputeSummary struct {
+	LowStep  uint64      `json:"low_step"`
+	HighStep uint64      `json:"high_step"`
+	WinnerID string      `json:"winner_id,omitempty"`
+	Cost     DisputeCost `json:"cost"`
 }
 
 // Result contains either two disagreeing commitments or one accepted state.
 type Result struct {
-	Status        Status
-	JobID         protocol.Digest
-	State         job.State
-	StateHash     protocol.Digest
-	Commitments   []Commitment
-	Findings      []Finding
-	CleanupErrors []string
+	Status         Status
+	JobID          protocol.Digest
+	State          job.State
+	StateHash      protocol.Digest
+	Commitments    []Commitment
+	Findings       []Finding
+	OverallVerdict string
+	Acceptance     *AcceptanceBasis
+	Dispute        *DisputeSummary
+	CleanupErrors  []string
 }
 
 // Coordinator talks to exactly two configured workers.
 type Coordinator struct {
-	endpoints [2]Endpoint
-	client    *http.Client
-	limits    protocol.Limits
-	attempts  atomic.Uint64
+	endpoints      [2]Endpoint
+	client         *http.Client
+	limits         protocol.Limits
+	requestTimeout time.Duration
+	jobTimeout     time.Duration
+	attempts       atomic.Uint64
 }
 
 // New validates a two-worker loopback configuration.
 func New(endpoints []Endpoint, client *http.Client, limits protocol.Limits) (*Coordinator, error) {
+	config := DefaultConfig()
+	config.Limits = limits
+	return NewWithConfig(endpoints, client, config)
+}
+
+// NewWithConfig validates a two-worker loopback configuration and deadline
+// policy.
+func NewWithConfig(endpoints []Endpoint, client *http.Client, config Config) (*Coordinator, error) {
 	if len(endpoints) != 2 {
 		return nil, fmt.Errorf("coordinator requires exactly two workers, got %d", len(endpoints))
 	}
 	if client == nil {
 		return nil, fmt.Errorf("HTTP client is required")
 	}
-	if err := limits.Validate(); err != nil {
+	if err := config.validate(); err != nil {
 		return nil, err
 	}
 	var validated [2]Endpoint
@@ -95,7 +166,13 @@ func New(endpoints []Endpoint, client *http.Client, limits protocol.Limits) (*Co
 	ownedClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	return &Coordinator{endpoints: validated, client: &ownedClient, limits: limits}, nil
+	return &Coordinator{
+		endpoints:      validated,
+		client:         &ownedClient,
+		limits:         config.Limits,
+		requestTimeout: config.RequestTimeout,
+		jobTimeout:     config.JobTimeout,
+	}, nil
 }
 
 func validateEndpoint(endpoint Endpoint) (Endpoint, error) {
@@ -122,6 +199,8 @@ func validateEndpoint(endpoint Endpoint) (Endpoint, error) {
 // Run dispatches a job concurrently, compares final-state hashes, retrieves
 // and validates an agreed state, and then releases both worker attempts.
 func (coordinator *Coordinator) Run(ctx context.Context, spec job.JobSpec) (Result, error) {
+	ctx, cancel := context.WithTimeout(ctx, coordinator.jobTimeout)
+	defer cancel()
 	if err := coordinator.limits.ValidateJob(spec); err != nil {
 		return Result{}, err
 	}
@@ -155,15 +234,14 @@ func (coordinator *Coordinator) Run(ctx context.Context, spec job.JobSpec) (Resu
 	}
 	group.Wait()
 	for i, execution := range executions {
-		if execution.err != nil {
-			return Result{}, fmt.Errorf("execute on %s: %w", coordinator.endpoints[i].ID, execution.err)
-		}
 		result.Commitments[i] = execution.commitment
+		if execution.err != nil {
+			return result, fmt.Errorf("execute on %s: %w", coordinator.endpoints[i].ID, execution.err)
+		}
 	}
 
 	if result.Commitments[0].FinalStateHash != result.Commitments[1].FinalStateHash {
-		result.Status = NeedsDispute
-		return result, nil
+		return coordinator.resolveDispute(ctx, machine, result)
 	}
 
 	agreedHash := result.Commitments[0].FinalStateHash
@@ -173,21 +251,52 @@ func (coordinator *Coordinator) Run(ctx context.Context, spec job.JobSpec) (Resu
 			ctx, coordinator.endpoints[i], jobID, commitment.AttemptID, machine, agreedHash,
 		)
 		if err == nil {
+			closeRound := uint64(2)
+			if len(result.Findings) != 0 {
+				opening := coordinator.requestOpening(
+					ctx, coordinator.endpoints[i], jobID, commitment,
+					machine.LeafCount(), machine.LeafCount()-1, 2,
+				)
+				if opening.err != nil {
+					return result, fmt.Errorf("open fallback final state on %s: %w", commitment.WorkerID, opening.err)
+				}
+				if opening.bad || opening.hash != agreedHash {
+					result.Findings = append(result.Findings, newFinding(
+						commitment.WorkerID, protocol.VerdictBadOpening, machine.LeafCount()-1,
+					))
+					result.Status = Rejected
+					result.CleanupErrors = coordinator.closeAttempts(ctx, jobID, result.Commitments, 3)
+					return result, nil
+				}
+				closeRound = 3
+			}
 			result.Status = Accepted
 			result.State = state
 			result.StateHash = agreedHash
-			result.CleanupErrors = coordinator.closeAttempts(ctx, jobID, result.Commitments)
+			if len(result.Findings) == 0 {
+				result.Acceptance = &AcceptanceBasis{Kind: BasisFinalStateAgreement}
+			} else {
+				finding := result.Findings[0]
+				result.Acceptance = &AcceptanceBasis{
+					Kind: BasisLoserProvenFaulty, FaultyWorker: finding.WorkerID, Verdict: finding.Verdict,
+				}
+			}
+			result.CleanupErrors = coordinator.closeAttempts(ctx, jobID, result.Commitments, closeRound)
 			return result, nil
 		}
 		if badState {
-			result.Findings = append(result.Findings, Finding{
-				WorkerID: commitment.WorkerID,
-				Verdict:  protocol.VerdictBadState,
-			})
+			result.Findings = append(result.Findings, newFinding(
+				commitment.WorkerID, protocol.VerdictBadState, machine.LeafCount()-1,
+			))
 		}
 		retrievalErrors = append(retrievalErrors, fmt.Errorf("%s: %w", commitment.WorkerID, err))
 	}
-	return Result{}, fmt.Errorf("no worker returned the agreed final state: %w", errors.Join(retrievalErrors...))
+	if len(result.Findings) == len(result.Commitments) {
+		result.Status = Rejected
+		result.CleanupErrors = coordinator.closeAttempts(ctx, jobID, result.Commitments, 2)
+		return result, nil
+	}
+	return result, fmt.Errorf("no worker returned the agreed final state: %w", errors.Join(retrievalErrors...))
 }
 
 func (coordinator *Coordinator) execute(
@@ -233,9 +342,24 @@ func (coordinator *Coordinator) fetchAndValidateState(
 	machine *job.Machine,
 	wantHash protocol.Digest,
 ) (job.State, bool, error) {
-	meta := protocol.Meta{JobID: protocol.EncodeDigest(jobID), AttemptID: attemptID, Round: 1}
+	return coordinator.fetchAndValidateFinalState(ctx, endpoint, jobID, attemptID, machine, wantHash, 1)
+}
+
+func (coordinator *Coordinator) fetchAndValidateFinalState(
+	ctx context.Context,
+	endpoint Endpoint,
+	jobID protocol.Digest,
+	attemptID uint64,
+	machine *job.Machine,
+	wantHash protocol.Digest,
+	round uint64,
+) (job.State, bool, error) {
+	meta := protocol.Meta{JobID: protocol.EncodeDigest(jobID), AttemptID: attemptID, Round: round}
 	var response protocol.FinalStateResponse
 	if err := coordinator.post(ctx, endpoint.URL+protocol.FinalStatePath, protocol.FinalStateRequest{Meta: meta}, &response); err != nil {
+		if errors.Is(err, errInvalidWorkerResponse) {
+			return job.State{}, true, err
+		}
 		return job.State{}, false, err
 	}
 	if !protocol.SameMeta(response.Meta, meta) {
@@ -265,6 +389,7 @@ func (coordinator *Coordinator) closeAttempts(
 	ctx context.Context,
 	jobID protocol.Digest,
 	commitments []Commitment,
+	round uint64,
 ) []string {
 	errorsByWorker := make([]error, len(commitments))
 	var group sync.WaitGroup
@@ -273,7 +398,7 @@ func (coordinator *Coordinator) closeAttempts(
 		i, commitment := i, commitment
 		go func() {
 			defer group.Done()
-			meta := protocol.Meta{JobID: protocol.EncodeDigest(jobID), AttemptID: commitment.AttemptID, Round: 2}
+			meta := protocol.Meta{JobID: protocol.EncodeDigest(jobID), AttemptID: commitment.AttemptID, Round: round}
 			var response protocol.CloseResponse
 			if err := coordinator.post(ctx, coordinator.endpoints[i].URL+protocol.ClosePath, protocol.CloseRequest{Meta: meta}, &response); err != nil {
 				errorsByWorker[i] = err
@@ -295,6 +420,8 @@ func (coordinator *Coordinator) closeAttempts(
 }
 
 func (coordinator *Coordinator) post(ctx context.Context, address string, requestValue, responseValue any) error {
+	ctx, cancel := context.WithTimeout(ctx, coordinator.requestTimeout)
+	defer cancel()
 	payload, err := json.Marshal(requestValue)
 	if err != nil {
 		return fmt.Errorf("encode request: %w", err)
@@ -314,27 +441,30 @@ func (coordinator *Coordinator) post(ctx context.Context, address string, reques
 	}
 	defer response.Body.Close()
 
-	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
-	if err != nil || mediaType != protocol.JSONContentType {
-		return fmt.Errorf("response Content-Type must be application/json")
-	}
 	limited := io.LimitReader(response.Body, coordinator.limits.MaxBodyBytes+1)
 	data, err := io.ReadAll(limited)
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
 	}
 	if int64(len(data)) > coordinator.limits.MaxBodyBytes {
-		return fmt.Errorf("response exceeds %d-byte protocol limit", coordinator.limits.MaxBodyBytes)
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			return fmt.Errorf("worker returned oversized HTTP %d response", response.StatusCode)
+		}
+		return fmt.Errorf("%w: body exceeds %d-byte protocol limit", errInvalidWorkerResponse, coordinator.limits.MaxBodyBytes)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		var failure protocol.ErrorResponse
 		if err := decodeOne(data, &failure); err != nil {
-			return fmt.Errorf("worker returned HTTP %d with invalid error body", response.StatusCode)
+			return fmt.Errorf("worker returned HTTP %d", response.StatusCode)
 		}
 		return fmt.Errorf("worker returned HTTP %d %s: %s", response.StatusCode, failure.Code, failure.Message)
 	}
+	mediaType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
+	if err != nil || mediaType != protocol.JSONContentType {
+		return fmt.Errorf("%w: Content-Type must be application/json", errInvalidWorkerResponse)
+	}
 	if err := decodeOne(data, responseValue); err != nil {
-		return fmt.Errorf("decode response: %w", err)
+		return fmt.Errorf("%w: %v", errInvalidWorkerResponse, err)
 	}
 	return nil
 }

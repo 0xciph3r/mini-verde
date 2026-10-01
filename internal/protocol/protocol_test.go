@@ -47,6 +47,67 @@ func TestDefaultLimitsRejectOversizedJobs(t *testing.T) {
 	}
 }
 
+func TestLimitsRejectBatchWorkAndRetainedStateBudgets(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		limits func(Limits) Limits
+	}{
+		{
+			name: "batch",
+			limits: func(limits Limits) Limits {
+				limits.MaxBatchSize = 1
+				return limits
+			},
+		},
+		{
+			name: "total work",
+			limits: func(limits Limits) Limits {
+				limits.MaxWork = 1
+				return limits
+			},
+		},
+		{
+			name: "retained states",
+			limits: func(limits Limits) Limits {
+				limits.MaxRetainedStateBytes = 1
+				return limits
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			limits := tc.limits(DefaultLimits())
+			spec := JobSpecForTest()
+			if tc.name == "batch" {
+				spec.BatchSize = 2
+				spec.Dataset.Examples = 2
+				spec.Dataset.Inputs = []float32{0.5, -0.5}
+				spec.Dataset.Targets = []float32{0.25, -0.25}
+			}
+			if err := limits.ValidateJob(spec); err == nil {
+				t.Fatalf("ValidateJob() accepted a job above the %s limit", tc.name)
+			}
+		})
+	}
+}
+
+func TestRetainedStateBudgetChargesFinalStateSeparately(t *testing.T) {
+	t.Parallel()
+
+	spec := JobSpecForTest()
+	spec.Steps = CheckpointInterval
+	// Four parameters and 78 fixed bytes make a 94-byte canonical state.
+	// Steps 0 and 32 are checkpoints; this budget fits those two but not the
+	// separately retained final state.
+	limits := DefaultLimits()
+	limits.MaxRetainedStateBytes = 2 * 94
+	if err := limits.ValidateJob(spec); err == nil {
+		t.Fatal("ValidateJob() did not charge the separately retained final state")
+	}
+}
+
 func JobSpecForTest() job.JobSpec {
 	return job.JobSpec{
 		Version: job.ProtocolVersion, Seed: 1, Steps: 2,
