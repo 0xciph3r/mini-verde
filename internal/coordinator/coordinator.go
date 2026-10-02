@@ -1,5 +1,6 @@
-// Package coordinator runs one canonical job on two workers and accepts only
-// an independently retrieved state whose hash matches both commitments.
+// Package coordinator runs one canonical job on an ordered worker pool and
+// accepts only an independently retrieved state whose hash matches a verified
+// commitment.
 package coordinator
 
 import (
@@ -22,19 +23,26 @@ import (
 	"github.com/0xciph3r/mini-verde/internal/protocol"
 )
 
-// Status describes whether a result is ready for use or requires the dispute
-// protocol implemented in a later milestone.
+// Status describes whether a result is accepted, rejected by objective
+// evidence, or unresolved after exhausting its liveness budget.
 type Status string
 
 const (
-	Accepted Status = "Accepted"
-	Rejected Status = "Rejected"
+	Accepted   Status = "Accepted"
+	Rejected   Status = "Rejected"
+	Unresolved Status = "Unresolved"
 
 	BasisFinalStateAgreement = "FinalStateAgreement"
 	BasisLoserProvenFaulty   = "LoserProvenFaulty"
 )
 
 var errInvalidWorkerResponse = errors.New("invalid worker response")
+
+var (
+	errWorkerUnavailable = errors.New("worker unavailable")
+	errRequestDeadline   = errors.New("worker request deadline")
+	errJobDeadline       = errors.New("job deadline")
+)
 
 const (
 	DefaultRequestTimeout = 30 * time.Second
@@ -85,6 +93,27 @@ type Finding struct {
 	WorkerID string  `json:"worker_id"`
 	Verdict  string  `json:"verdict"`
 	Step     *uint64 `json:"step,omitempty"`
+	Phase    string  `json:"phase,omitempty"`
+}
+
+type AttemptOutcome string
+
+const (
+	AttemptReady      AttemptOutcome = "Ready"
+	AttemptAccepted   AttemptOutcome = "Accepted"
+	AttemptFaulty     AttemptOutcome = "Faulty"
+	AttemptTimedOut   AttemptOutcome = "Timeout"
+	AttemptUnresolved AttemptOutcome = "Unresolved"
+)
+
+// AttemptSummary is the coordinator's ordered audit record for one dispatch.
+type AttemptSummary struct {
+	WorkerID       string         `json:"worker_id"`
+	AttemptID      uint64         `json:"attempt_id"`
+	PairGeneration uint64         `json:"pair_generation,omitempty"`
+	Outcome        AttemptOutcome `json:"outcome"`
+	Root           string         `json:"root,omitempty"`
+	FinalStateHash string         `json:"final_state_hash,omitempty"`
 }
 
 type AcceptanceBasis struct {
@@ -102,48 +131,89 @@ type DisputeCost struct {
 }
 
 type DisputeSummary struct {
-	LowStep  uint64      `json:"low_step"`
-	HighStep uint64      `json:"high_step"`
-	WinnerID string      `json:"winner_id,omitempty"`
-	Cost     DisputeCost `json:"cost"`
+	LowStep        uint64      `json:"low_step"`
+	HighStep       uint64      `json:"high_step"`
+	WinnerID       string      `json:"winner_id,omitempty"`
+	PairGeneration uint64      `json:"pair_generation"`
+	Cost           DisputeCost `json:"cost"`
 }
 
 // Result contains either two disagreeing commitments or one accepted state.
 type Result struct {
-	Status         Status
-	JobID          protocol.Digest
-	State          job.State
-	StateHash      protocol.Digest
-	Commitments    []Commitment
-	Findings       []Finding
-	OverallVerdict string
-	Acceptance     *AcceptanceBasis
-	Dispute        *DisputeSummary
-	CleanupErrors  []string
+	Status          Status
+	JobID           protocol.Digest
+	State           job.State
+	StateHash       protocol.Digest
+	Commitments     []Commitment
+	Findings        []Finding
+	OverallVerdict  string
+	Acceptance      *AcceptanceBasis
+	Dispute         *DisputeSummary
+	PairDisputes    []DisputeSummary
+	CleanupErrors   []string
+	Attempts        []AttemptSummary
+	PairGenerations uint64
+	Replacements    uint64
+	Reputation      map[string]Reputation
 }
 
-// Coordinator talks to exactly two configured workers.
+type replica struct {
+	endpoint   Endpoint
+	commitment Commitment
+	record     int
+}
+
+type activePair struct {
+	replicas   [2]replica
+	generation uint64
+}
+
+func (pair activePair) commitments() []Commitment {
+	return []Commitment{pair.replicas[0].commitment, pair.replicas[1].commitment}
+}
+
+type roundClock struct{ next uint64 }
+
+func (clock *roundClock) take() uint64 {
+	round := clock.next
+	clock.next++
+	return round
+}
+
+type unavailableError struct {
+	slots []int
+	phase string
+	err   error
+}
+
+func (failure *unavailableError) Error() string {
+	return fmt.Sprintf("%s unavailable in slots %v: %v", failure.phase, failure.slots, failure.err)
+}
+
+func (failure *unavailableError) Unwrap() error { return failure.err }
+
+// Coordinator keeps two active replicas from an ordered worker pool.
 type Coordinator struct {
-	endpoints      [2]Endpoint
+	endpoints      []Endpoint
 	client         *http.Client
 	limits         protocol.Limits
 	requestTimeout time.Duration
 	jobTimeout     time.Duration
 	attempts       atomic.Uint64
+	reputation     reputationLog
 }
 
-// New validates a two-worker loopback configuration.
+// New validates an ordered loopback worker pool.
 func New(endpoints []Endpoint, client *http.Client, limits protocol.Limits) (*Coordinator, error) {
 	config := DefaultConfig()
 	config.Limits = limits
 	return NewWithConfig(endpoints, client, config)
 }
 
-// NewWithConfig validates a two-worker loopback configuration and deadline
-// policy.
+// NewWithConfig validates an ordered loopback worker pool and deadline policy.
 func NewWithConfig(endpoints []Endpoint, client *http.Client, config Config) (*Coordinator, error) {
-	if len(endpoints) != 2 {
-		return nil, fmt.Errorf("coordinator requires exactly two workers, got %d", len(endpoints))
+	if len(endpoints) < 2 {
+		return nil, fmt.Errorf("coordinator requires at least two workers, got %d", len(endpoints))
 	}
 	if client == nil {
 		return nil, fmt.Errorf("HTTP client is required")
@@ -151,16 +221,18 @@ func NewWithConfig(endpoints []Endpoint, client *http.Client, config Config) (*C
 	if err := config.validate(); err != nil {
 		return nil, err
 	}
-	var validated [2]Endpoint
+	validated := make([]Endpoint, len(endpoints))
+	workerIDs := make(map[string]struct{}, len(endpoints))
 	for i, endpoint := range endpoints {
 		parsed, err := validateEndpoint(endpoint)
 		if err != nil {
 			return nil, fmt.Errorf("worker %d: %w", i, err)
 		}
 		validated[i] = parsed
-	}
-	if validated[0].ID == validated[1].ID {
-		return nil, fmt.Errorf("worker IDs must be distinct")
+		if _, exists := workerIDs[parsed.ID]; exists {
+			return nil, fmt.Errorf("worker IDs must be distinct")
+		}
+		workerIDs[parsed.ID] = struct{}{}
 	}
 	ownedClient := *client
 	ownedClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
@@ -196,10 +268,10 @@ func validateEndpoint(endpoint Endpoint) (Endpoint, error) {
 	return endpoint, nil
 }
 
-// Run dispatches a job concurrently, compares final-state hashes, retrieves
-// and validates an agreed state, and then releases both worker attempts.
+// Run dispatches a job to an active pair and deterministically replaces
+// workers that fail to answer while the coordinator-owned job deadline holds.
 func (coordinator *Coordinator) Run(ctx context.Context, spec job.JobSpec) (Result, error) {
-	ctx, cancel := context.WithTimeout(ctx, coordinator.jobTimeout)
+	ctx, cancel := context.WithTimeoutCause(ctx, coordinator.jobTimeout, errJobDeadline)
 	defer cancel()
 	if err := coordinator.limits.ValidateJob(spec); err != nil {
 		return Result{}, err
@@ -212,91 +284,15 @@ func (coordinator *Coordinator) Run(ctx context.Context, spec job.JobSpec) (Resu
 	if err != nil {
 		return Result{}, err
 	}
-	jobID := machine.ID()
-	result := Result{JobID: jobID, Commitments: make([]Commitment, 2)}
-
-	type execution struct {
-		commitment Commitment
-		err        error
+	run := jobRun{
+		coordinator: coordinator,
+		ctx:         ctx,
+		machine:     machine,
+		encodedJob:  encodedJob,
+		jobID:       machine.ID(),
+		clock:       roundClock{next: 1},
 	}
-	executions := make([]execution, 2)
-	var group sync.WaitGroup
-	group.Add(2)
-	for i := range coordinator.endpoints {
-		i := i
-		attemptID := coordinator.attempts.Add(1)
-		go func() {
-			defer group.Done()
-			executions[i].commitment, executions[i].err = coordinator.execute(
-				ctx, coordinator.endpoints[i], jobID, attemptID, encodedJob,
-			)
-		}()
-	}
-	group.Wait()
-	for i, execution := range executions {
-		result.Commitments[i] = execution.commitment
-		if execution.err != nil {
-			return result, fmt.Errorf("execute on %s: %w", coordinator.endpoints[i].ID, execution.err)
-		}
-	}
-
-	if result.Commitments[0].FinalStateHash != result.Commitments[1].FinalStateHash {
-		return coordinator.resolveDispute(ctx, machine, result)
-	}
-
-	agreedHash := result.Commitments[0].FinalStateHash
-	var retrievalErrors []error
-	for i, commitment := range result.Commitments {
-		state, badState, err := coordinator.fetchAndValidateState(
-			ctx, coordinator.endpoints[i], jobID, commitment.AttemptID, machine, agreedHash,
-		)
-		if err == nil {
-			closeRound := uint64(2)
-			if len(result.Findings) != 0 {
-				opening := coordinator.requestOpening(
-					ctx, coordinator.endpoints[i], jobID, commitment,
-					machine.LeafCount(), machine.LeafCount()-1, 2,
-				)
-				if opening.err != nil {
-					return result, fmt.Errorf("open fallback final state on %s: %w", commitment.WorkerID, opening.err)
-				}
-				if opening.bad || opening.hash != agreedHash {
-					result.Findings = append(result.Findings, newFinding(
-						commitment.WorkerID, protocol.VerdictBadOpening, machine.LeafCount()-1,
-					))
-					result.Status = Rejected
-					result.CleanupErrors = coordinator.closeAttempts(ctx, jobID, result.Commitments, 3)
-					return result, nil
-				}
-				closeRound = 3
-			}
-			result.Status = Accepted
-			result.State = state
-			result.StateHash = agreedHash
-			if len(result.Findings) == 0 {
-				result.Acceptance = &AcceptanceBasis{Kind: BasisFinalStateAgreement}
-			} else {
-				finding := result.Findings[0]
-				result.Acceptance = &AcceptanceBasis{
-					Kind: BasisLoserProvenFaulty, FaultyWorker: finding.WorkerID, Verdict: finding.Verdict,
-				}
-			}
-			result.CleanupErrors = coordinator.closeAttempts(ctx, jobID, result.Commitments, closeRound)
-			return result, nil
-		}
-		if badState {
-			result.Findings = append(result.Findings, newFinding(
-				commitment.WorkerID, protocol.VerdictBadState, machine.LeafCount()-1,
-			))
-		}
-		retrievalErrors = append(retrievalErrors, fmt.Errorf("%s: %w", commitment.WorkerID, err))
-	}
-	if len(result.Findings) == len(result.Commitments) {
-		result.Status = Rejected
-		result.CleanupErrors = coordinator.closeAttempts(ctx, jobID, result.Commitments, 2)
-		return result, nil
-	}
-	return result, fmt.Errorf("no worker returned the agreed final state: %w", errors.Join(retrievalErrors...))
+	return run.execute()
 }
 
 func (coordinator *Coordinator) execute(
@@ -332,17 +328,6 @@ func (coordinator *Coordinator) execute(
 		Root:           root,
 		FinalStateHash: finalHash,
 	}, nil
-}
-
-func (coordinator *Coordinator) fetchAndValidateState(
-	ctx context.Context,
-	endpoint Endpoint,
-	jobID protocol.Digest,
-	attemptID uint64,
-	machine *job.Machine,
-	wantHash protocol.Digest,
-) (job.State, bool, error) {
-	return coordinator.fetchAndValidateFinalState(ctx, endpoint, jobID, attemptID, machine, wantHash, 1)
 }
 
 func (coordinator *Coordinator) fetchAndValidateFinalState(
@@ -385,42 +370,55 @@ func (coordinator *Coordinator) fetchAndValidateFinalState(
 	return state, false, nil
 }
 
-func (coordinator *Coordinator) closeAttempts(
+func (coordinator *Coordinator) closePair(
 	ctx context.Context,
 	jobID protocol.Digest,
-	commitments []Commitment,
+	pair activePair,
 	round uint64,
 ) []string {
-	errorsByWorker := make([]error, len(commitments))
+	errorsByWorker := make([]error, len(pair.replicas))
 	var group sync.WaitGroup
-	group.Add(len(commitments))
-	for i, commitment := range commitments {
-		i, commitment := i, commitment
+	group.Add(len(pair.replicas))
+	for i, replica := range pair.replicas {
+		i, replica := i, replica
 		go func() {
 			defer group.Done()
-			meta := protocol.Meta{JobID: protocol.EncodeDigest(jobID), AttemptID: commitment.AttemptID, Round: round}
-			var response protocol.CloseResponse
-			if err := coordinator.post(ctx, coordinator.endpoints[i].URL+protocol.ClosePath, protocol.CloseRequest{Meta: meta}, &response); err != nil {
-				errorsByWorker[i] = err
-				return
-			}
-			if !protocol.SameMeta(response.Meta, meta) || response.WorkerID != commitment.WorkerID || !response.Closed {
-				errorsByWorker[i] = fmt.Errorf("invalid close acknowledgement")
-			}
+			errorsByWorker[i] = coordinator.closeReplica(ctx, jobID, replica, round)
 		}()
 	}
 	group.Wait()
 	var messages []string
 	for i, err := range errorsByWorker {
 		if err != nil {
-			messages = append(messages, fmt.Sprintf("%s: %v", commitments[i].WorkerID, err))
+			messages = append(messages, fmt.Sprintf("%s: %v", pair.replicas[i].endpoint.ID, err))
 		}
 	}
 	return messages
 }
 
+func (coordinator *Coordinator) closeReplica(
+	ctx context.Context,
+	jobID protocol.Digest,
+	replica replica,
+	round uint64,
+) error {
+	meta := protocol.Meta{
+		JobID: protocol.EncodeDigest(jobID), AttemptID: replica.commitment.AttemptID, Round: round,
+	}
+	var response protocol.CloseResponse
+	if err := coordinator.post(
+		ctx, replica.endpoint.URL+protocol.ClosePath, protocol.CloseRequest{Meta: meta}, &response,
+	); err != nil {
+		return err
+	}
+	if !protocol.SameMeta(response.Meta, meta) || response.WorkerID != replica.endpoint.ID || !response.Closed {
+		return fmt.Errorf("invalid close acknowledgement")
+	}
+	return nil
+}
+
 func (coordinator *Coordinator) post(ctx context.Context, address string, requestValue, responseValue any) error {
-	ctx, cancel := context.WithTimeout(ctx, coordinator.requestTimeout)
+	ctx, cancel := context.WithTimeoutCause(ctx, coordinator.requestTimeout, errRequestDeadline)
 	defer cancel()
 	payload, err := json.Marshal(requestValue)
 	if err != nil {
@@ -437,23 +435,44 @@ func (coordinator *Coordinator) post(ctx context.Context, address string, reques
 	request.Header.Set("Accept", protocol.JSONContentType)
 	response, err := coordinator.client.Do(request)
 	if err != nil {
-		return err
+		if cause := context.Cause(ctx); cause != nil {
+			if errors.Is(cause, errRequestDeadline) {
+				return fmt.Errorf("%w: %w", errWorkerUnavailable, cause)
+			}
+			return cause
+		}
+		return fmt.Errorf("%w: %v", errWorkerUnavailable, err)
 	}
 	defer response.Body.Close()
 
 	limited := io.LimitReader(response.Body, coordinator.limits.MaxBodyBytes+1)
 	data, err := io.ReadAll(limited)
 	if err != nil {
-		return fmt.Errorf("read response: %w", err)
+		if cause := context.Cause(ctx); cause != nil {
+			if errors.Is(cause, errRequestDeadline) {
+				return fmt.Errorf("%w: %w", errWorkerUnavailable, cause)
+			}
+			return cause
+		}
+		return fmt.Errorf("%w: read response: %v", errWorkerUnavailable, err)
 	}
 	if int64(len(data)) > coordinator.limits.MaxBodyBytes {
 		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			if isUnavailableStatus(response.StatusCode) {
+				return fmt.Errorf("%w: oversized HTTP %d response", errWorkerUnavailable, response.StatusCode)
+			}
 			return fmt.Errorf("worker returned oversized HTTP %d response", response.StatusCode)
 		}
 		return fmt.Errorf("%w: body exceeds %d-byte protocol limit", errInvalidWorkerResponse, coordinator.limits.MaxBodyBytes)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		var failure protocol.ErrorResponse
+		if isUnavailableStatus(response.StatusCode) {
+			if err := decodeOne(data, &failure); err == nil {
+				return fmt.Errorf("%w: HTTP %d %s: %s", errWorkerUnavailable, response.StatusCode, failure.Code, failure.Message)
+			}
+			return fmt.Errorf("%w: HTTP %d", errWorkerUnavailable, response.StatusCode)
+		}
 		if err := decodeOne(data, &failure); err != nil {
 			return fmt.Errorf("worker returned HTTP %d", response.StatusCode)
 		}
@@ -467,6 +486,16 @@ func (coordinator *Coordinator) post(ctx context.Context, address string, reques
 		return fmt.Errorf("%w: %v", errInvalidWorkerResponse, err)
 	}
 	return nil
+}
+
+func isUnavailableStatus(status int) bool {
+	switch status {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return status >= 500
+	}
 }
 
 func decodeOne(data []byte, destination any) error {

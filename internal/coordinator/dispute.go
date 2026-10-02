@@ -21,25 +21,30 @@ type verifiedOpening struct {
 func (coordinator *Coordinator) resolveDispute(
 	ctx context.Context,
 	machine *job.Machine,
+	pair activePair,
 	result Result,
+	clock *roundClock,
 ) (Result, error) {
 	finalStep := machine.LeafCount() - 1
-	result.Dispute = &DisputeSummary{Cost: DisputeCost{
+	result.Dispute = &DisputeSummary{PairGeneration: pair.generation, Cost: DisputeCost{
 		WorkerRecomputeStepsExpected: map[string]uint64{
 			result.Commitments[0].WorkerID: 0,
 			result.Commitments[1].WorkerID: 0,
 		},
 	}}
-	maxRound := dispute.CeilLog2(finalStep) + 5
-	round := uint64(1)
+	maxLogicalRounds := dispute.CeilLog2(finalStep) + 5
+	logicalRounds := uint64(0)
 
 	// The first query binds each advertised final hash to its own root.
-	finalOpenings, err := coordinator.openPair(ctx, machine, result, finalStep, round)
+	round, err := nextDisputeRound(result.Dispute, &logicalRounds, maxLogicalRounds, clock)
+	if err != nil {
+		return result, err
+	}
+	finalOpenings, err := coordinator.openPair(ctx, machine, pair, result, finalStep, round)
 	result.Dispute.Cost.StepHashRounds++
 	if err != nil {
 		return result, err
 	}
-	round++
 	badFinal := make([]int, 0, 2)
 	for i, opening := range finalOpenings {
 		if opening.bad || opening.hash != result.Commitments[i].FinalStateHash {
@@ -50,7 +55,10 @@ func (coordinator *Coordinator) resolveDispute(
 		}
 	}
 	if len(badFinal) != 0 {
-		return coordinator.finishBoundaryFault(ctx, machine, result, finalOpenings, badFinal, round, maxRound)
+		return coordinator.finishBoundaryFault(
+			ctx, machine, pair, result, finalOpenings, badFinal,
+			&logicalRounds, maxLogicalRounds, clock,
+		)
 	}
 
 	initialState := machine.InitialState()
@@ -58,12 +66,15 @@ func (coordinator *Coordinator) resolveDispute(
 	if err != nil {
 		return result, fmt.Errorf("hash initial state: %w", err)
 	}
-	initialOpenings, err := coordinator.openPair(ctx, machine, result, 0, round)
+	round, err = nextDisputeRound(result.Dispute, &logicalRounds, maxLogicalRounds, clock)
+	if err != nil {
+		return result, err
+	}
+	initialOpenings, err := coordinator.openPair(ctx, machine, pair, result, 0, round)
 	result.Dispute.Cost.StepHashRounds++
 	if err != nil {
 		return result, err
 	}
-	round++
 	badInitial := make([]int, 0, 2)
 	for i, opening := range initialOpenings {
 		verdict := ""
@@ -78,7 +89,10 @@ func (coordinator *Coordinator) resolveDispute(
 		}
 	}
 	if len(badInitial) != 0 {
-		return coordinator.finishBoundaryFault(ctx, machine, result, finalOpenings, badInitial, round, maxRound)
+		return coordinator.finishBoundaryFault(
+			ctx, machine, pair, result, finalOpenings, badInitial,
+			&logicalRounds, maxLogicalRounds, clock,
+		)
 	}
 
 	game, err := dispute.New(finalStep, initialHash, [2]dispute.Digest{
@@ -95,16 +109,16 @@ func (coordinator *Coordinator) resolveDispute(
 		if !more {
 			break
 		}
-		if round > maxRound {
-			return result, fmt.Errorf("dispute exceeded round bound %d", maxRound)
+		round, err = nextDisputeRound(result.Dispute, &logicalRounds, maxLogicalRounds, clock)
+		if err != nil {
+			return result, err
 		}
-		openings, err := coordinator.openPair(ctx, machine, result, index, round)
+		openings, err := coordinator.openPair(ctx, machine, pair, result, index, round)
 		result.Dispute.Cost.StepHashRounds++
 		result.Dispute.Cost.BisectionRounds++
 		if err != nil {
 			return result, err
 		}
-		round++
 		bad := make([]int, 0, 2)
 		for i, opening := range openings {
 			if opening.bad {
@@ -115,7 +129,10 @@ func (coordinator *Coordinator) resolveDispute(
 			}
 		}
 		if len(bad) != 0 {
-			return coordinator.finishBoundaryFault(ctx, machine, result, finalOpenings, bad, round, maxRound)
+			return coordinator.finishBoundaryFault(
+				ctx, machine, pair, result, finalOpenings, bad,
+				&logicalRounds, maxLogicalRounds, clock,
+			)
 		}
 		if err := game.Observe(index, [2]dispute.Digest{openings[0].hash, openings[1].hash}); err != nil {
 			return result, fmt.Errorf("observe dispute midpoint: %w", err)
@@ -131,43 +148,71 @@ func (coordinator *Coordinator) resolveDispute(
 		return result, fmt.Errorf("bisection accounting mismatch")
 	}
 
-	if round > maxRound {
-		return result, fmt.Errorf("dispute exceeded round bound %d", maxRound)
+	round, err = nextDisputeRound(result.Dispute, &logicalRounds, maxLogicalRounds, clock)
+	if err != nil {
+		return result, err
 	}
 	state, badState, err := coordinator.fetchIndexedState(
-		ctx, coordinator.endpoints[0], result.JobID, result.Commitments[0].AttemptID,
+		ctx, pair.replicas[0].endpoint, result.JobID, result.Commitments[0].AttemptID,
 		machine, transition.LowStep, transition.AgreedHash, round,
 	)
 	result.Dispute.Cost.WorkerRecomputeStepsExpected[result.Commitments[0].WorkerID] +=
 		transition.LowStep % protocol.CheckpointInterval
-	if err != nil && !badState {
+	firstUnavailable := err != nil && !badState && errors.Is(err, errWorkerUnavailable)
+	if err != nil && !badState && !firstUnavailable {
 		return result, fmt.Errorf("fetch agreed state from %s: %w", result.Commitments[0].WorkerID, err)
 	}
-	if badState {
-		result.Findings = append(result.Findings, newFinding(
-			result.Commitments[0].WorkerID, protocol.VerdictBadState, transition.LowStep,
-		))
+	if firstUnavailable {
+		result.Findings = append(result.Findings, timeoutFinding(result.Commitments[0].WorkerID, "agreed-state"))
+	}
+	if badState || firstUnavailable {
+		firstBadState := badState
+		if badState {
+			result.Findings = append(result.Findings, newFinding(
+				result.Commitments[0].WorkerID, protocol.VerdictBadState, transition.LowStep,
+			))
+		}
 		state, badState, err = coordinator.fetchIndexedState(
-			ctx, coordinator.endpoints[1], result.JobID, result.Commitments[1].AttemptID,
+			ctx, pair.replicas[1].endpoint, result.JobID, result.Commitments[1].AttemptID,
 			machine, transition.LowStep, transition.AgreedHash, round,
 		)
 		result.Dispute.Cost.WorkerRecomputeStepsExpected[result.Commitments[1].WorkerID] +=
 			transition.LowStep % protocol.CheckpointInterval
-		if err != nil && !badState {
+		if err != nil && !badState && !errors.Is(err, errWorkerUnavailable) {
 			return result, fmt.Errorf("fetch agreed state from %s: %w", result.Commitments[1].WorkerID, err)
+		}
+		if err != nil && !badState {
+			result.Findings = append(result.Findings, timeoutFinding(result.Commitments[1].WorkerID, "agreed-state"))
+			slots := []int{1}
+			if firstUnavailable {
+				slots = []int{0, 1}
+			}
+			return result, &unavailableError{slots: slots, phase: "agreed-state", err: err}
 		}
 		if badState {
 			result.Findings = append(result.Findings, newFinding(
 				result.Commitments[1].WorkerID, protocol.VerdictBadState, transition.LowStep,
 			))
+			if firstUnavailable {
+				return result, &unavailableError{
+					slots: []int{0}, phase: "agreed-state", err: errors.New("peer returned a bad agreed state"),
+				}
+			}
 			result.Status = Rejected
-			result.Dispute.Cost.LogicalRounds = round + 1
-			result.CleanupErrors = coordinator.closeAttempts(ctx, result.JobID, result.Commitments, round+1)
+			closeRound, roundErr := nextDisputeRound(result.Dispute, &logicalRounds, maxLogicalRounds, clock)
+			if roundErr != nil {
+				return result, roundErr
+			}
+			result.CleanupErrors = coordinator.closePair(ctx, result.JobID, pair, closeRound)
 			return result, nil
 		}
-		return coordinator.acceptProvenWinner(ctx, machine, result, finalOpenings, 1, round+1, maxRound)
+		if firstBadState {
+			return coordinator.acceptProvenWinner(
+				ctx, machine, pair, result, finalOpenings, 1,
+				&logicalRounds, maxLogicalRounds, clock,
+			)
+		}
 	}
-	round++
 
 	next, err := machine.Step(state)
 	if err != nil {
@@ -189,12 +234,18 @@ func (coordinator *Coordinator) resolveDispute(
 	}
 	switch len(wrong) {
 	case 1:
-		return coordinator.acceptProvenWinner(ctx, machine, result, finalOpenings, 1-wrong[0], round, maxRound)
+		return coordinator.acceptProvenWinner(
+			ctx, machine, pair, result, finalOpenings, 1-wrong[0],
+			&logicalRounds, maxLogicalRounds, clock,
+		)
 	case 2:
 		result.Status = Rejected
 		result.OverallVerdict = protocol.VerdictBothWrong
-		result.Dispute.Cost.LogicalRounds = round
-		result.CleanupErrors = coordinator.closeAttempts(ctx, result.JobID, result.Commitments, round)
+		closeRound, roundErr := nextDisputeRound(result.Dispute, &logicalRounds, maxLogicalRounds, clock)
+		if roundErr != nil {
+			return result, roundErr
+		}
+		result.CleanupErrors = coordinator.closePair(ctx, result.JobID, pair, closeRound)
 		return result, nil
 	default:
 		return result, fmt.Errorf("disagreed high hashes both matched the referee")
@@ -204,26 +255,43 @@ func (coordinator *Coordinator) resolveDispute(
 func (coordinator *Coordinator) openPair(
 	ctx context.Context,
 	machine *job.Machine,
+	pair activePair,
 	result Result,
 	index, round uint64,
 ) ([2]verifiedOpening, error) {
 	var openings [2]verifiedOpening
 	var group sync.WaitGroup
 	group.Add(2)
-	for i := range coordinator.endpoints {
+	for i := range pair.replicas {
 		i := i
 		go func() {
 			defer group.Done()
 			openings[i] = coordinator.requestOpening(
-				ctx, coordinator.endpoints[i], result.JobID, result.Commitments[i],
+				ctx, pair.replicas[i].endpoint, result.JobID, result.Commitments[i],
 				machine.LeafCount(), index, round,
 			)
 		}()
 	}
 	group.Wait()
+	var unavailableSlots []int
+	var unavailableErrors []error
 	for i, opening := range openings {
 		if opening.err != nil {
-			return openings, fmt.Errorf("open step %d on %s: %w", index, result.Commitments[i].WorkerID, opening.err)
+			if errors.Is(opening.err, errWorkerUnavailable) {
+				unavailableSlots = append(unavailableSlots, i)
+				unavailableErrors = append(unavailableErrors, opening.err)
+				continue
+			}
+			return openings, fmt.Errorf(
+				"open step %d on %s: %w", index, result.Commitments[i].WorkerID, opening.err,
+			)
+		}
+	}
+	if len(unavailableSlots) != 0 {
+		return openings, &unavailableError{
+			slots: unavailableSlots,
+			phase: "step-hash",
+			err:   errors.Join(unavailableErrors...),
 		}
 	}
 	return openings, nil
@@ -310,43 +378,57 @@ func (coordinator *Coordinator) fetchIndexedState(
 func (coordinator *Coordinator) finishBoundaryFault(
 	ctx context.Context,
 	machine *job.Machine,
+	pair activePair,
 	result Result,
 	finalOpenings [2]verifiedOpening,
 	faulty []int,
-	round, maxRound uint64,
+	logicalRounds *uint64,
+	maxLogicalRounds uint64,
+	clock *roundClock,
 ) (Result, error) {
 	if len(faulty) == 1 {
-		return coordinator.acceptProvenWinner(ctx, machine, result, finalOpenings, 1-faulty[0], round, maxRound)
+		return coordinator.acceptProvenWinner(
+			ctx, machine, pair, result, finalOpenings, 1-faulty[0],
+			logicalRounds, maxLogicalRounds, clock,
+		)
 	}
 	result.Status = Rejected
-	if allFindingsAre(result.Findings, protocol.VerdictWrongStep) {
+	if allObjectiveFindingsAre(result.Findings, protocol.VerdictWrongStep) {
 		result.OverallVerdict = protocol.VerdictBothWrong
 	}
-	if round > maxRound {
-		return result, fmt.Errorf("dispute exceeded round bound %d", maxRound)
+	closeRound, err := nextDisputeRound(result.Dispute, logicalRounds, maxLogicalRounds, clock)
+	if err != nil {
+		return result, err
 	}
-	result.Dispute.Cost.LogicalRounds = round
-	result.CleanupErrors = coordinator.closeAttempts(ctx, result.JobID, result.Commitments, round)
+	result.CleanupErrors = coordinator.closePair(ctx, result.JobID, pair, closeRound)
 	return result, nil
 }
 
 func (coordinator *Coordinator) acceptProvenWinner(
 	ctx context.Context,
 	machine *job.Machine,
+	pair activePair,
 	result Result,
 	finalOpenings [2]verifiedOpening,
 	winner int,
-	round, maxRound uint64,
+	logicalRounds *uint64,
+	maxLogicalRounds uint64,
+	clock *roundClock,
 ) (Result, error) {
-	if round+1 > maxRound {
-		return result, fmt.Errorf("dispute exceeded round bound %d", maxRound)
+	round, err := nextDisputeRound(result.Dispute, logicalRounds, maxLogicalRounds, clock)
+	if err != nil {
+		return result, err
 	}
 	winnerCommitment := result.Commitments[winner]
 	state, badState, err := coordinator.fetchAndValidateFinalState(
-		ctx, coordinator.endpoints[winner], result.JobID, winnerCommitment.AttemptID,
+		ctx, pair.replicas[winner].endpoint, result.JobID, winnerCommitment.AttemptID,
 		machine, finalOpenings[winner].hash, round,
 	)
 	if err != nil && !badState {
+		if errors.Is(err, errWorkerUnavailable) {
+			result.Findings = append(result.Findings, timeoutFinding(winnerCommitment.WorkerID, "winner-final-state"))
+			return result, &unavailableError{slots: []int{winner}, phase: "winner-final-state", err: err}
+		}
 		return result, fmt.Errorf("fetch winner final state from %s: %w", winnerCommitment.WorkerID, err)
 	}
 	if badState {
@@ -354,14 +436,18 @@ func (coordinator *Coordinator) acceptProvenWinner(
 			winnerCommitment.WorkerID, protocol.VerdictBadState, machine.LeafCount()-1,
 		))
 		result.Status = Rejected
-		result.Dispute.Cost.LogicalRounds = round + 1
-		result.CleanupErrors = coordinator.closeAttempts(ctx, result.JobID, result.Commitments, round+1)
+		closeRound, roundErr := nextDisputeRound(result.Dispute, logicalRounds, maxLogicalRounds, clock)
+		if roundErr != nil {
+			return result, roundErr
+		}
+		result.CleanupErrors = coordinator.closePair(ctx, result.JobID, pair, closeRound)
 		return result, nil
 	}
-	if len(result.Findings) != 1 {
+	objective := objectiveFindings(result.Findings)
+	if len(objective) != 1 {
 		return result, fmt.Errorf("winner selected without exactly one proven faulty worker")
 	}
-	fault := result.Findings[0]
+	fault := objective[0]
 	result.Status = Accepted
 	result.State = state
 	result.StateHash = finalOpenings[winner].hash
@@ -369,8 +455,11 @@ func (coordinator *Coordinator) acceptProvenWinner(
 		Kind: BasisLoserProvenFaulty, FaultyWorker: fault.WorkerID, Verdict: fault.Verdict,
 	}
 	result.Dispute.WinnerID = winnerCommitment.WorkerID
-	result.Dispute.Cost.LogicalRounds = round + 1
-	result.CleanupErrors = coordinator.closeAttempts(ctx, result.JobID, result.Commitments, round+1)
+	closeRound, roundErr := nextDisputeRound(result.Dispute, logicalRounds, maxLogicalRounds, clock)
+	if roundErr != nil {
+		return result, roundErr
+	}
+	result.CleanupErrors = coordinator.closePair(ctx, result.JobID, pair, closeRound)
 	return result, nil
 }
 
@@ -379,14 +468,29 @@ func newFinding(workerID, verdict string, step uint64) Finding {
 	return Finding{WorkerID: workerID, Verdict: verdict, Step: &ownedStep}
 }
 
-func allFindingsAre(findings []Finding, verdict string) bool {
-	if len(findings) == 0 {
+func allObjectiveFindingsAre(findings []Finding, verdict string) bool {
+	objective := objectiveFindings(findings)
+	if len(objective) == 0 {
 		return false
 	}
-	for _, finding := range findings {
+	for _, finding := range objective {
 		if finding.Verdict != verdict {
 			return false
 		}
 	}
 	return true
+}
+
+func nextDisputeRound(
+	summary *DisputeSummary,
+	logicalRounds *uint64,
+	maxLogicalRounds uint64,
+	clock *roundClock,
+) (uint64, error) {
+	*logicalRounds++
+	summary.Cost.LogicalRounds = *logicalRounds
+	if *logicalRounds > maxLogicalRounds {
+		return 0, fmt.Errorf("dispute exceeded round bound %d", maxLogicalRounds)
+	}
+	return clock.take(), nil
 }

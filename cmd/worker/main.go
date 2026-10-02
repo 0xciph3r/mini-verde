@@ -30,6 +30,9 @@ func run() error {
 	flags := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
 	workerID := flags.String("id", "", "stable worker identifier")
 	listenAddress := flags.String("listen", "127.0.0.1:8081", "loopback listen address")
+	behavior := flags.String("behavior", string(worker.BehaviorHonest), "worker behavior for deterministic fault injection")
+	faultSeed := flags.Uint64("fault-seed", 0, "seed for deterministic fault injection")
+	behaviorDelay := flags.Duration("behavior-delay", 0, "delay applied by the slow behavior")
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		return err
 	}
@@ -39,7 +42,15 @@ func run() error {
 	if err := validateLoopbackAddress(*listenAddress); err != nil {
 		return err
 	}
-	handler, err := worker.New(*workerID, protocol.DefaultLimits())
+	config := worker.DefaultConfig()
+	config.Limits = protocol.DefaultLimits()
+	config.Behavior = worker.Behavior(*behavior)
+	config.FaultSeed = *faultSeed
+	config.Delay = *behaviorDelay
+	if config.Behavior == worker.BehaviorCrasher {
+		config.Crash = func() { os.Exit(70) }
+	}
+	handler, err := worker.NewWithConfig(*workerID, config)
 	if err != nil {
 		return err
 	}

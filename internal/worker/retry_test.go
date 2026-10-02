@@ -90,6 +90,43 @@ func TestExecuteAttemptOutlivesRPCDeadlineAndRemainsRetryable(t *testing.T) {
 	}
 }
 
+func TestCloseCancelsAndReclaimsRunningAttempt(t *testing.T) {
+	limits := protocol.DefaultLimits()
+	limits.MaxConcurrentExecutions = 1
+	server, err := New("worker-a", limits)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	server.jobs <- struct{}{}
+	defer func() { <-server.jobs }()
+	execute := executePayload(t, 1)
+	executeDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { executeDone <- servePayload(server, protocol.ExecutePath, execute) }()
+	waitFor(t, func() bool { return server.ExecutionCount() == 1 })
+
+	meta := payloadMeta(t, execute)
+	meta.Round = 1
+	closePayload := marshalPayload(t, protocol.CloseRequest{Meta: meta})
+	closed := servePayload(server, protocol.ClosePath, closePayload)
+	if closed.Code != http.StatusOK {
+		t.Fatalf("close status = %d, body = %s", closed.Code, closed.Body.String())
+	}
+	select {
+	case <-executeDone:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled execution did not return")
+	}
+	if got := server.ActiveAttempts(); got != 0 {
+		t.Fatalf("active attempts = %d, want 0", got)
+	}
+	if got := server.ClosedAttempts(); got != 1 {
+		t.Fatalf("closed attempts = %d, want 1", got)
+	}
+	if retry := servePayload(server, protocol.ClosePath, closePayload); retry.Code != http.StatusOK {
+		t.Fatalf("idempotent close status = %d, want %d", retry.Code, http.StatusOK)
+	}
+}
+
 func TestRoundRuleMatrix(t *testing.T) {
 	server, err := New("worker-a", protocol.DefaultLimits())
 	if err != nil {

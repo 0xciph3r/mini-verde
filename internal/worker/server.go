@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/0xciph3r/mini-verde/internal/job"
 	"github.com/0xciph3r/mini-verde/internal/merkle"
@@ -25,6 +26,7 @@ type attemptStatus uint8
 const (
 	attemptRunning attemptStatus = iota + 1
 	attemptReady
+	attemptClosing
 	attemptClosed
 )
 
@@ -39,6 +41,8 @@ type attempt struct {
 	lastOperation string
 	lastRequest   [sha256.Size]byte
 	done          chan struct{}
+	ctx           context.Context
+	cancel        context.CancelFunc
 	err           error
 	commitment    protocol.ExecuteResponse
 	stateHashes   []protocol.Digest
@@ -46,6 +50,7 @@ type attempt struct {
 	machine       *job.Machine
 	checkpoints   map[uint64]job.State
 	finalState    []byte
+	lied          bool
 }
 
 // Server is a concurrency-safe HTTP worker.
@@ -58,21 +63,38 @@ type Server struct {
 	attempts       map[attemptKey]*attempt
 	executions     atomic.Uint64
 	recomputations atomic.Uint64
+	behavior       Behavior
+	faultSeed      uint64
+	delay          time.Duration
+	crash          func()
 }
 
 func New(id string, limits protocol.Limits) (*Server, error) {
+	config := DefaultConfig()
+	config.Limits = limits
+	return NewWithConfig(id, config)
+}
+
+func NewWithConfig(id string, config Config) (*Server, error) {
 	if strings.TrimSpace(id) == "" || len(id) > 128 {
 		return nil, fmt.Errorf("worker ID must contain 1 to 128 characters")
 	}
-	if err := limits.Validate(); err != nil {
+	if config.Behavior == "" {
+		config.Behavior = BehaviorHonest
+	}
+	if err := config.validate(); err != nil {
 		return nil, err
 	}
 	server := &Server{
-		id:       id,
-		limits:   limits,
-		mux:      http.NewServeMux(),
-		jobs:     make(chan struct{}, limits.MaxConcurrentExecutions),
-		attempts: make(map[attemptKey]*attempt),
+		id:        id,
+		limits:    config.Limits,
+		mux:       http.NewServeMux(),
+		jobs:      make(chan struct{}, config.Limits.MaxConcurrentExecutions),
+		attempts:  make(map[attemptKey]*attempt),
+		behavior:  config.Behavior,
+		faultSeed: config.FaultSeed,
+		delay:     config.Delay,
+		crash:     config.Crash,
 	}
 	server.mux.HandleFunc(protocol.ExecutePath, server.handleExecute)
 	server.mux.HandleFunc(protocol.FinalStatePath, server.handleFinalState)
@@ -83,8 +105,41 @@ func New(id string, limits protocol.Limits) (*Server, error) {
 }
 
 func (server *Server) ServeHTTP(response http.ResponseWriter, request *http.Request) {
+	switch server.behavior {
+	case BehaviorStaller:
+		if request.URL.Path == protocol.ExecutePath {
+			// Accept and execute the job, but suppress the response. The attempt is
+			// deliberately retained because this behavior also stalls close.
+			server.mux.ServeHTTP(newDiscardResponse(), request)
+		} else {
+			// Drain the bounded body so HTTP/1.1 cancellation propagates instead of
+			// leaving an unread-body connection stuck.
+			_, _ = io.Copy(io.Discard, request.Body)
+			_ = request.Body.Close()
+		}
+		<-request.Context().Done()
+		return
+	case BehaviorSlow:
+		timer := time.NewTimer(server.delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-request.Context().Done():
+			return
+		}
+	}
 	server.mux.ServeHTTP(response, request)
 }
+
+type discardResponse struct{ header http.Header }
+
+func newDiscardResponse() *discardResponse {
+	return &discardResponse{header: make(http.Header)}
+}
+
+func (response *discardResponse) Header() http.Header      { return response.header }
+func (*discardResponse) WriteHeader(int)                   {}
+func (*discardResponse) Write(payload []byte) (int, error) { return len(payload), nil }
 
 func (server *Server) ActiveAttempts() int {
 	server.mu.Lock()
@@ -176,8 +231,7 @@ func (server *Server) handleExecute(response http.ResponseWriter, request *http.
 
 	// The attempt outlives this RPC. A coordinator deadline stops waiting but
 	// does not erase bounded work that an exact retry can later join.
-	executionContext := context.WithoutCancel(request.Context())
-	commitment, hashes, tree, checkpoints, finalState, err := server.execute(executionContext, machine, message.Meta)
+	commitment, hashes, tree, checkpoints, finalState, err := server.execute(current.ctx, machine, message.Meta)
 	server.finishAttempt(key, machine, commitment, hashes, tree, checkpoints, finalState, err)
 	if err != nil {
 		status := http.StatusInternalServerError
@@ -208,8 +262,10 @@ func (server *Server) beginAttempt(key attemptKey, fingerprint [sha256.Size]byte
 	if server.activeAttemptsLocked() >= server.limits.MaxActiveAttempts {
 		return nil, false, http.StatusServiceUnavailable, fmt.Errorf("worker retains the maximum number of active attempts")
 	}
+	executionContext, cancel := context.WithCancel(context.Background())
 	current := &attempt{
-		status: attemptRunning, done: make(chan struct{}), lastOperation: "execute", lastRequest: fingerprint,
+		status: attemptRunning, done: make(chan struct{}), ctx: executionContext, cancel: cancel,
+		lastOperation: "execute", lastRequest: fingerprint,
 	}
 	server.attempts[key] = current
 	return current, true, 0, nil
@@ -228,6 +284,13 @@ func (server *Server) finishAttempt(
 	server.mu.Lock()
 	defer server.mu.Unlock()
 	current := server.attempts[key]
+	if current.status == attemptClosing {
+		current.status = attemptClosed
+		current.err = nil
+		clearAttempt(current)
+		close(current.done)
+		return
+	}
 	current.err = err
 	if err == nil {
 		current.status = attemptReady
@@ -240,6 +303,7 @@ func (server *Server) finishAttempt(
 	} else {
 		delete(server.attempts, key)
 	}
+	current.cancel()
 	close(current.done)
 }
 
@@ -257,6 +321,7 @@ func (server *Server) execute(
 	}
 
 	state := machine.InitialState()
+	faultAt := server.faultStep(machine)
 	checkpoints := map[uint64]job.State{0: state}
 	hashes := make([]protocol.Digest, 0, machine.LeafCount())
 	for {
@@ -276,6 +341,17 @@ func (server *Server) execute(
 		state, err = machine.Step(state)
 		if err != nil {
 			return protocol.ExecuteResponse{}, nil, nil, nil, nil, err
+		}
+		if state.Step == faultAt {
+			switch server.behavior {
+			case BehaviorCorruptLate, BehaviorCorruptAll, BehaviorLazy, BehaviorLiarOnBisect:
+				corruptState(&state)
+			case BehaviorCrasher:
+				if server.crash != nil {
+					server.crash()
+				}
+				return protocol.ExecuteResponse{}, nil, nil, nil, nil, errInjectedCrash
+			}
 		}
 		if state.Step%protocol.CheckpointInterval == 0 {
 			checkpoints[state.Step] = state
@@ -334,6 +410,11 @@ func (server *Server) handleStepHash(response http.ResponseWriter, request *http
 	}
 	stateHash := current.stateHashes[message.Index]
 	proof, err := current.tree.Proof(message.Index)
+	lie := server.behavior == BehaviorLiarOnBisect && message.Index != 0 &&
+		message.Index+1 != uint64(len(current.stateHashes)) && !current.lied
+	if lie {
+		current.lied = true
+	}
 	server.mu.Unlock()
 	if err != nil {
 		server.writeError(response, http.StatusInternalServerError, message.Meta, "proof_failed", err)
@@ -342,6 +423,13 @@ func (server *Server) handleStepHash(response http.ResponseWriter, request *http
 	siblings := make([]string, len(proof.Siblings))
 	for i, sibling := range proof.Siblings {
 		siblings[i] = protocol.EncodeDigest(sibling)
+	}
+	if lie && len(siblings) != 0 {
+		if siblings[0][0] == '0' {
+			siblings[0] = "1" + siblings[0][1:]
+		} else {
+			siblings[0] = "0" + siblings[0][1:]
+		}
 	}
 	server.writeJSON(response, http.StatusOK, protocol.StepHashResponse{
 		Meta: message.Meta, WorkerID: server.id, Hash: protocol.EncodeDigest(stateHash),
@@ -479,6 +567,40 @@ func (server *Server) handleClose(response http.ResponseWriter, request *http.Re
 		server.writeJSON(response, http.StatusOK, protocol.CloseResponse{Meta: message.Meta, WorkerID: server.id, Closed: true})
 		return
 	}
+	if current.status == attemptClosing {
+		if current.highestRound != message.Round || current.lastOperation != "close" || current.lastRequest != fingerprint {
+			server.mu.Unlock()
+			server.writeError(response, http.StatusConflict, message.Meta, "stale_round", fmt.Errorf("attempt is already closing"))
+			return
+		}
+		done := current.done
+		server.mu.Unlock()
+		select {
+		case <-done:
+			server.writeJSON(response, http.StatusOK, protocol.CloseResponse{Meta: message.Meta, WorkerID: server.id, Closed: true})
+		case <-request.Context().Done():
+			server.writeError(response, http.StatusRequestTimeout, message.Meta, "request_cancelled", request.Context().Err())
+		}
+		return
+	}
+	if current.status == attemptRunning {
+		if err := advanceRound(current, message.Round, "close", fingerprint); err != nil {
+			server.mu.Unlock()
+			server.writeError(response, http.StatusConflict, message.Meta, "stale_round", err)
+			return
+		}
+		current.status = attemptClosing
+		current.cancel()
+		done := current.done
+		server.mu.Unlock()
+		select {
+		case <-done:
+			server.writeJSON(response, http.StatusOK, protocol.CloseResponse{Meta: message.Meta, WorkerID: server.id, Closed: true})
+		case <-request.Context().Done():
+			server.writeError(response, http.StatusRequestTimeout, message.Meta, "request_cancelled", request.Context().Err())
+		}
+		return
+	}
 	if current.status != attemptReady {
 		server.mu.Unlock()
 		server.writeError(response, http.StatusConflict, message.Meta, "attempt_not_ready", fmt.Errorf("attempt cannot be closed"))
@@ -490,13 +612,20 @@ func (server *Server) handleClose(response http.ResponseWriter, request *http.Re
 		return
 	}
 	current.status = attemptClosed
+	current.cancel()
+	clearAttempt(current)
+	server.mu.Unlock()
+	server.writeJSON(response, http.StatusOK, protocol.CloseResponse{Meta: message.Meta, WorkerID: server.id, Closed: true})
+}
+
+func clearAttempt(current *attempt) {
+	current.ctx = nil
+	current.cancel = nil
 	current.stateHashes = nil
 	current.tree = nil
 	current.machine = nil
 	current.checkpoints = nil
 	current.finalState = nil
-	server.mu.Unlock()
-	server.writeJSON(response, http.StatusOK, protocol.CloseResponse{Meta: message.Meta, WorkerID: server.id, Closed: true})
 }
 
 func advanceRound(current *attempt, round uint64, operation string, fingerprint [sha256.Size]byte) error {

@@ -212,15 +212,18 @@ func TestExpiredOpeningIsUnresolvedAndNeverBadOpening(t *testing.T) {
 	client := mustCoordinatorWithConfig(t, honestServer.URL, corruptServer.URL, config)
 
 	result, err := client.Run(context.Background(), smallSpec(1))
-	if err == nil {
-		t.Fatal("Run() succeeded despite expired opening requests")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
 	}
-	if len(result.Findings) != 0 {
-		t.Fatalf("expired context produced verdicts: %+v", result.Findings)
+	if result.Status != coordinator.Unresolved || len(result.Findings) != 2 {
+		t.Fatalf("result = %+v, want Unresolved with two Timeout findings", result)
 	}
-	if honest.ActiveAttempts() != 1 || corrupt.activeAttempts() != 1 {
-		t.Fatal("unresolved opening deadline did not retain both attempts")
+	for _, finding := range result.Findings {
+		if finding.Verdict != protocol.VerdictTimeout {
+			t.Fatalf("finding = %+v, want Timeout", finding)
+		}
 	}
+	waitForCoordinator(t, func() bool { return honest.ActiveAttempts() == 0 && corrupt.activeAttempts() == 0 })
 }
 
 type traceWorker struct {

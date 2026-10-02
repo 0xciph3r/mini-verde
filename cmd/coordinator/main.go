@@ -1,4 +1,5 @@
-// Command coordinator submits one canonical Mini-Verde job to two workers.
+// Command coordinator submits one canonical Mini-Verde job to an ordered
+// worker pool while keeping two replicas active.
 package main
 
 import (
@@ -31,15 +32,20 @@ func (values *workerFlags) Set(value string) error {
 }
 
 type output struct {
-	Status         coordinator.Status           `json:"status"`
-	JobID          string                       `json:"job_id"`
-	FinalStateHash string                       `json:"final_state_hash,omitempty"`
-	Roots          []string                     `json:"roots"`
-	Findings       []coordinator.Finding        `json:"findings,omitempty"`
-	OverallVerdict string                       `json:"overall_verdict,omitempty"`
-	Acceptance     *coordinator.AcceptanceBasis `json:"acceptance,omitempty"`
-	Dispute        *coordinator.DisputeSummary  `json:"dispute,omitempty"`
-	CleanupErrors  []string                     `json:"cleanup_errors,omitempty"`
+	Status          coordinator.Status                `json:"status"`
+	JobID           string                            `json:"job_id"`
+	FinalStateHash  string                            `json:"final_state_hash,omitempty"`
+	Roots           []string                          `json:"roots"`
+	Findings        []coordinator.Finding             `json:"findings,omitempty"`
+	OverallVerdict  string                            `json:"overall_verdict,omitempty"`
+	Acceptance      *coordinator.AcceptanceBasis      `json:"acceptance,omitempty"`
+	Dispute         *coordinator.DisputeSummary       `json:"dispute,omitempty"`
+	PairDisputes    []coordinator.DisputeSummary      `json:"pair_disputes,omitempty"`
+	CleanupErrors   []string                          `json:"cleanup_errors,omitempty"`
+	Attempts        []coordinator.AttemptSummary      `json:"attempts"`
+	PairGenerations uint64                            `json:"pair_generations"`
+	Replacements    uint64                            `json:"replacements"`
+	Reputation      map[string]coordinator.Reputation `json:"reputation"`
 }
 
 func main() {
@@ -55,7 +61,7 @@ func run() error {
 	requestTimeout := flags.Duration("request-timeout", coordinator.DefaultRequestTimeout, "deadline for each worker HTTP call")
 	jobTimeout := flags.Duration("job-timeout", coordinator.DefaultJobTimeout, "overall job deadline")
 	var workers workerFlags
-	flags.Var(&workers, "worker", "worker endpoint as id=http://host:port (repeat twice)")
+	flags.Var(&workers, "worker", "worker endpoint as id=http://host:port (repeat at least twice)")
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		return err
 	}
@@ -89,14 +95,19 @@ func run() error {
 	}
 
 	report := output{
-		Status:         result.Status,
-		JobID:          protocol.EncodeDigest(result.JobID),
-		Roots:          make([]string, len(result.Commitments)),
-		Findings:       result.Findings,
-		OverallVerdict: result.OverallVerdict,
-		Acceptance:     result.Acceptance,
-		Dispute:        result.Dispute,
-		CleanupErrors:  result.CleanupErrors,
+		Status:          result.Status,
+		JobID:           protocol.EncodeDigest(result.JobID),
+		Roots:           make([]string, len(result.Commitments)),
+		Findings:        result.Findings,
+		OverallVerdict:  result.OverallVerdict,
+		Acceptance:      result.Acceptance,
+		Dispute:         result.Dispute,
+		PairDisputes:    result.PairDisputes,
+		CleanupErrors:   result.CleanupErrors,
+		Attempts:        result.Attempts,
+		PairGenerations: result.PairGenerations,
+		Replacements:    result.Replacements,
+		Reputation:      result.Reputation,
 	}
 	if result.Status == coordinator.Accepted {
 		report.FinalStateHash = protocol.EncodeDigest(result.StateHash)
@@ -110,8 +121,8 @@ func run() error {
 }
 
 func parseWorkers(values []string) ([]coordinator.Endpoint, error) {
-	if len(values) != 2 {
-		return nil, fmt.Errorf("exactly two --worker values are required")
+	if len(values) < 2 {
+		return nil, fmt.Errorf("at least two --worker values are required")
 	}
 	endpoints := make([]coordinator.Endpoint, len(values))
 	for i, value := range values {

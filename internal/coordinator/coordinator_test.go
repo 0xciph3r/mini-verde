@@ -173,7 +173,7 @@ func TestBothBadFinalStatesAreRejectedWithoutLosingVerdicts(t *testing.T) {
 	}
 }
 
-func TestFinalStateDeadlineIsUnresolvedAndDoesNotBlameWorkers(t *testing.T) {
+func TestFinalStateDeadlineIsUnresolvedAndRecordsAvailabilityOnly(t *testing.T) {
 	limits := protocol.DefaultLimits()
 	workerA, serverA := startWorker(t, "worker-a", limits, stallResponse(protocol.FinalStatePath))
 	workerB, serverB := startWorker(t, "worker-b", limits, stallResponse(protocol.FinalStatePath))
@@ -185,18 +185,21 @@ func TestFinalStateDeadlineIsUnresolvedAndDoesNotBlameWorkers(t *testing.T) {
 
 	started := time.Now()
 	result, err := client.Run(context.Background(), smallSpec(1))
-	if err == nil {
-		t.Fatal("Run() succeeded despite workers that never answer final-state requests")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
 	}
 	if time.Since(started) > 500*time.Millisecond {
 		t.Fatalf("Run() exceeded configured request deadlines: %v", time.Since(started))
 	}
-	if len(result.Findings) != 0 {
-		t.Fatalf("deadline produced worker verdicts: %+v", result.Findings)
+	if result.Status != coordinator.Unresolved || len(result.Findings) != 2 {
+		t.Fatalf("result = %+v, want Unresolved with two Timeout findings", result)
 	}
-	if workerA.ActiveAttempts() != 1 || workerB.ActiveAttempts() != 1 {
-		t.Fatal("unresolved deadline did not retain both attempts")
+	for _, finding := range result.Findings {
+		if finding.Verdict != protocol.VerdictTimeout {
+			t.Fatalf("finding = %+v, want Timeout", finding)
+		}
 	}
+	waitForCoordinator(t, func() bool { return workerA.ActiveAttempts() == 0 && workerB.ActiveAttempts() == 0 })
 }
 
 func TestOverallJobDeadlineBoundsAStalledExecute(t *testing.T) {
@@ -209,16 +212,18 @@ func TestOverallJobDeadlineBoundsAStalledExecute(t *testing.T) {
 	config.JobTimeout = 40 * time.Millisecond
 	client := mustCoordinatorWithConfig(t, serverA.URL, serverB.URL, config)
 
+	started := time.Now()
 	result, err := client.Run(context.Background(), smallSpec(1))
-	if err == nil {
-		t.Fatal("Run() succeeded despite stalled execute responses")
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
 	}
-	if len(result.Findings) != 0 {
+	if result.Status != coordinator.Unresolved || len(result.Findings) != 0 {
 		t.Fatalf("job deadline produced worker verdicts: %+v", result.Findings)
 	}
-	if workerA.ActiveAttempts() != 1 || workerB.ActiveAttempts() != 1 {
-		t.Fatal("unresolved job deadline did not retain both attempts")
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("overall deadline returned after %v, want bounded independently of cleanup", elapsed)
 	}
+	waitForCoordinator(t, func() bool { return workerA.ActiveAttempts() == 0 && workerB.ActiveAttempts() == 0 })
 }
 
 func TestMismatchedResponseMetadataIsRejected(t *testing.T) {
