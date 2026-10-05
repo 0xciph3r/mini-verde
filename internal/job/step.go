@@ -24,84 +24,19 @@ func (m *Machine) Step(current State) (State, error) {
 	workspace := make([]float32, 2*m.paramCount+scratchCount)
 	nextParameters := m.parametersFrom(workspace[:m.paramCount])
 	gradients := m.parametersFrom(workspace[m.paramCount : 2*m.paramCount])
-	offset := 2 * m.paramCount
-	z1 := workspace[offset : offset+hiddenSize]
-	offset += hiddenSize
-	hidden := workspace[offset : offset+hiddenSize]
-	offset += hiddenSize
-	delta1 := workspace[offset : offset+hiddenSize]
-	offset += hiddenSize
-	prediction := workspace[offset : offset+outputSize]
-	offset += outputSize
-	delta2 := workspace[offset : offset+outputSize]
 
-	inputSize := int(m.spec.InputSize)
 	batchSize := int(m.spec.BatchSize)
 	examples := uint64(m.spec.Dataset.Examples)
 	batchBase := ((current.Step % examples) * uint64(m.spec.BatchSize)) % examples
 	for batchIndex := 0; batchIndex < batchSize; batchIndex++ {
 		example := (batchBase + uint64(batchIndex)) % examples
-		inputOffset := int(example) * inputSize
-		targetOffset := int(example) * outputSize
-		x := m.spec.Dataset.Inputs[inputOffset : inputOffset+inputSize]
-		target := m.spec.Dataset.Targets[targetOffset : targetOffset+outputSize]
-
-		for h := 0; h < hiddenSize; h++ {
-			sum := current.Parameters.B1[h]
-			row := h * inputSize
-			for i := 0; i < inputSize; i++ {
-				sum = repops.MulAdd(sum, current.Parameters.W1[row+i], x[i])
-			}
-			z1[h] = sum
-			if sum > 0 {
-				hidden[h] = sum
-			} else {
-				hidden[h] = 0
-			}
-		}
-
-		for o := 0; o < outputSize; o++ {
-			sum := current.Parameters.B2[o]
-			row := o * hiddenSize
-			for h := 0; h < hiddenSize; h++ {
-				sum = repops.MulAdd(sum, current.Parameters.W2[row+h], hidden[h])
-			}
-			prediction[o] = sum
-		}
-
-		for o := 0; o < outputSize; o++ {
-			delta2[o] = repops.Sub(prediction[o], target[o])
-		}
-
-		for h := 0; h < hiddenSize; h++ {
-			delta1[h] = 0
-			if z1[h] > 0 {
-				for o := 0; o < outputSize; o++ {
-					delta1[h] = repops.MulAdd(delta1[h], current.Parameters.W2[o*hiddenSize+h], delta2[o])
-				}
-			}
-		}
-
-		for h := 0; h < hiddenSize; h++ {
-			row := h * inputSize
-			for i := 0; i < inputSize; i++ {
-				gradients.W1[row+i] = repops.MulAdd(gradients.W1[row+i], delta1[h], x[i])
-			}
-		}
-		for h := 0; h < hiddenSize; h++ {
-			gradients.B1[h] = repops.Add(gradients.B1[h], delta1[h])
-		}
-		for o := 0; o < outputSize; o++ {
-			row := o * hiddenSize
-			for h := 0; h < hiddenSize; h++ {
-				gradients.W2[row+h] = repops.MulAdd(gradients.W2[row+h], delta2[o], hidden[h])
-			}
-		}
-		for o := 0; o < outputSize; o++ {
-			gradients.B2[o] = repops.Add(gradients.B2[o], delta2[o])
-		}
+		accumulateExampleGradient(m, current, example, gradients, workspace[2*m.paramCount:])
 	}
 
+	return m.advanceWithGradients(current, gradients, nextParameters)
+}
+
+func (m *Machine) advanceWithGradients(current State, gradients Parameters, nextParameters Parameters) (State, error) {
 	batchDivisor := float32(m.spec.BatchSize)
 	updateGroup(nextParameters.W1, current.Parameters.W1, gradients.W1, batchDivisor, m.spec.LearningRate)
 	updateGroup(nextParameters.B1, current.Parameters.B1, gradients.B1, batchDivisor, m.spec.LearningRate)
@@ -116,6 +51,77 @@ func (m *Machine) Step(current State) (State, error) {
 		return State{}, err
 	}
 	return next, nil
+}
+
+func accumulateExampleGradient(m *Machine, current State, example uint64, gradients Parameters, scratch []float32) {
+	inputSize := int(m.spec.InputSize)
+	hiddenSize := int(m.spec.HiddenSize)
+	outputSize := int(m.spec.OutputSize)
+	inputOffset := int(example) * inputSize
+	targetOffset := int(example) * outputSize
+	x := m.spec.Dataset.Inputs[inputOffset : inputOffset+inputSize]
+	target := m.spec.Dataset.Targets[targetOffset : targetOffset+outputSize]
+
+	z1 := scratch[:hiddenSize]
+	hidden := scratch[hiddenSize : 2*hiddenSize]
+	delta1 := scratch[2*hiddenSize : 3*hiddenSize]
+	prediction := scratch[3*hiddenSize : 3*hiddenSize+outputSize]
+	delta2 := scratch[3*hiddenSize+outputSize : 3*hiddenSize+2*outputSize]
+
+	for h := 0; h < hiddenSize; h++ {
+		sum := current.Parameters.B1[h]
+		row := h * inputSize
+		for i := 0; i < inputSize; i++ {
+			sum = repops.MulAdd(sum, current.Parameters.W1[row+i], x[i])
+		}
+		z1[h] = sum
+		if sum > 0 {
+			hidden[h] = sum
+		} else {
+			hidden[h] = 0
+		}
+	}
+
+	for o := 0; o < outputSize; o++ {
+		sum := current.Parameters.B2[o]
+		row := o * hiddenSize
+		for h := 0; h < hiddenSize; h++ {
+			sum = repops.MulAdd(sum, current.Parameters.W2[row+h], hidden[h])
+		}
+		prediction[o] = sum
+	}
+
+	for o := 0; o < outputSize; o++ {
+		delta2[o] = repops.Sub(prediction[o], target[o])
+	}
+
+	for h := 0; h < hiddenSize; h++ {
+		delta1[h] = 0
+		if z1[h] > 0 {
+			for o := 0; o < outputSize; o++ {
+				delta1[h] = repops.MulAdd(delta1[h], current.Parameters.W2[o*hiddenSize+h], delta2[o])
+			}
+		}
+	}
+
+	for h := 0; h < hiddenSize; h++ {
+		row := h * inputSize
+		for i := 0; i < inputSize; i++ {
+			gradients.W1[row+i] = repops.MulAdd(gradients.W1[row+i], delta1[h], x[i])
+		}
+	}
+	for h := 0; h < hiddenSize; h++ {
+		gradients.B1[h] = repops.Add(gradients.B1[h], delta1[h])
+	}
+	for o := 0; o < outputSize; o++ {
+		row := o * hiddenSize
+		for h := 0; h < hiddenSize; h++ {
+			gradients.W2[row+h] = repops.MulAdd(gradients.W2[row+h], delta2[o], hidden[h])
+		}
+	}
+	for o := 0; o < outputSize; o++ {
+		gradients.B2[o] = repops.Add(gradients.B2[o], delta2[o])
+	}
 }
 
 func updateGroup(dst, values, gradientSums []float32, batchSize, learningRate float32) {

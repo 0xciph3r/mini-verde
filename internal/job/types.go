@@ -108,6 +108,12 @@ func (m *Machine) ID() [sha256.Size]byte {
 	return m.id
 }
 
+// ValidateState checks a candidate without advancing it. Verification
+// policies use this before comparing independently supplied states.
+func (m *Machine) ValidateState(state State) error {
+	return m.validateState(state)
+}
+
 // LeafCount is the trusted number of committed states: the initial state and
 // one post-state for every job step.
 func (m *Machine) LeafCount() uint64 {

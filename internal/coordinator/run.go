@@ -25,6 +25,7 @@ type jobRun struct {
 	timedOut    map[string]struct{}
 	generations uint64
 	provenFault *Finding
+	journalErr  error
 }
 
 func (run *jobRun) execute() (Result, error) {
@@ -33,8 +34,14 @@ func (run *jobRun) execute() (Result, error) {
 		if cause := context.Cause(run.ctx); cause != nil {
 			return run.finishUnresolved(pair), run.contextError(cause)
 		}
+		if run.journalErr != nil {
+			return run.finishUnresolved(pair), run.journalErr
+		}
 		if !run.fillPair(&pair) {
 			return run.finishUnresolved(pair), nil
+		}
+		if run.journalErr != nil {
+			return run.finishUnresolved(pair), run.journalErr
 		}
 
 		failed, err := run.executePending(&pair)
@@ -43,6 +50,9 @@ func (run *jobRun) execute() (Result, error) {
 				return run.finishUnresolved(pair), run.contextError(cause)
 			}
 			return run.partialResult(pair), err
+		}
+		if run.journalErr != nil {
+			return run.finishUnresolved(pair), run.journalErr
 		}
 		if len(failed) != 0 {
 			for _, slot := range failed {
@@ -82,6 +92,9 @@ func (run *jobRun) execute() (Result, error) {
 		}
 		if pairErr == nil {
 			return run.finish(result, pair), nil
+		}
+		if run.journalErr != nil {
+			return run.finishUnresolved(pair), run.journalErr
 		}
 
 		var unavailable *unavailableError
@@ -141,6 +154,9 @@ func (run *jobRun) fillPair(pair *activePair) bool {
 			WorkerID:  endpoint.ID,
 			AttemptID: attemptID,
 		})
+		run.record("attempt/"+protocol.EncodeDigest(run.jobID)+fmt.Sprintf("/%d", attemptID), "attempt_assigned", map[string]any{
+			"attempt_id": attemptID, "worker_id": endpoint.ID,
+		})
 		pair.replicas[slot] = replica{
 			endpoint:   endpoint,
 			commitment: Commitment{WorkerID: endpoint.ID, AttemptID: attemptID},
@@ -184,6 +200,7 @@ func (run *jobRun) executePending(pair *activePair) ([]int, error) {
 			record.Outcome = AttemptReady
 			record.Root = protocol.EncodeDigest(execution.commitment.Root)
 			record.FinalStateHash = protocol.EncodeDigest(execution.commitment.FinalStateHash)
+			run.record("attempt/"+protocol.EncodeDigest(run.jobID)+fmt.Sprintf("/%d/commitment", replica.commitment.AttemptID), "commitment_ready", execution.commitment)
 			continue
 		}
 		if errors.Is(execution.err, errWorkerUnavailable) {
@@ -212,6 +229,18 @@ func (run *jobRun) recordTimeout(replica replica, phase string) {
 		Phase:    phase,
 	})
 	run.attempts[replica.record].Outcome = AttemptTimedOut
+	run.record("attempt/"+protocol.EncodeDigest(run.jobID)+fmt.Sprintf("/%d/timeout/%s", replica.commitment.AttemptID, phase), "attempt_timeout", map[string]string{
+		"worker_id": replica.endpoint.ID, "phase": phase,
+	})
+}
+
+func (run *jobRun) record(key, kind string, payload any) {
+	if run.journalErr != nil || run.coordinator.journal == nil {
+		return
+	}
+	if err := run.coordinator.recordTransition(run.jobID, key, kind, payload); err != nil {
+		run.journalErr = fmt.Errorf("durably record %s: %w", kind, err)
+	}
 }
 
 func (run *jobRun) recordTimeoutByID(pair activePair, workerID, phase string) {

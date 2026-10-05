@@ -179,6 +179,43 @@ func TestStepHashProofAndCheckpointReplay(t *testing.T) {
 	}
 }
 
+func TestParallelExecutionMatchesSequentialCommitment(t *testing.T) {
+	sequentialConfig := worker.DefaultConfig()
+	sequentialConfig.ExecutionWorkers = 1
+	sequential, err := worker.NewWithConfig("worker-sequential", sequentialConfig)
+	if err != nil {
+		t.Fatalf("sequential worker = %v", err)
+	}
+	parallelConfig := worker.DefaultConfig()
+	parallelConfig.ExecutionWorkers = 4
+	parallel, err := worker.NewWithConfig("worker-parallel", parallelConfig)
+	if err != nil {
+		t.Fatalf("parallel worker = %v", err)
+	}
+	spec := job.JobSpec{
+		Version: job.ProtocolVersion, Seed: 1, Steps: 4,
+		InputSize: 2, HiddenSize: 3, OutputSize: 1, BatchSize: 2,
+		LearningRate: job.DefaultLearningRate,
+		Dataset:      job.Dataset{Examples: 2, Inputs: []float32{0.5, -0.25, -0.25, 0.5}, Targets: []float32{0.125, -0.25}},
+	}
+	machine, err := job.NewMachine(spec)
+	if err != nil {
+		t.Fatalf("NewMachine() error = %v", err)
+	}
+	encoded, err := job.MarshalSpec(spec)
+	if err != nil {
+		t.Fatalf("MarshalSpec() error = %v", err)
+	}
+	payload := protocol.ExecuteRequest{Meta: protocol.Meta{JobID: protocol.EncodeDigest(machine.ID()), AttemptID: 9}, Job: encoded}
+	var sequentialCommitment protocol.ExecuteResponse
+	var parallelCommitment protocol.ExecuteResponse
+	postJSONDecode(t, sequential, protocol.ExecutePath, payload, &sequentialCommitment)
+	postJSONDecode(t, parallel, protocol.ExecutePath, payload, &parallelCommitment)
+	if sequentialCommitment.Root != parallelCommitment.Root || sequentialCommitment.FinalStateHash != parallelCommitment.FinalStateHash {
+		t.Fatalf("parallel commitment = %+v, sequential = %+v", parallelCommitment, sequentialCommitment)
+	}
+}
+
 func TestWorkerEnforcesBatchWorkAndRetentionAdmission(t *testing.T) {
 	tests := []struct {
 		name   string

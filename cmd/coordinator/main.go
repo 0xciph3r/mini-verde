@@ -60,6 +60,8 @@ func run() error {
 	jobPath := flags.String("job", "", "path to a JSON job specification")
 	requestTimeout := flags.Duration("request-timeout", coordinator.DefaultRequestTimeout, "deadline for each worker HTTP call")
 	jobTimeout := flags.Duration("job-timeout", coordinator.DefaultJobTimeout, "overall job deadline")
+	requestRetries := flags.Int("request-retries", coordinator.DefaultRequestRetries, "bounded retries for an unavailable worker request")
+	walPath := flags.String("wal", "mini-verde.wal", "append-only coordinator write-ahead log path")
 	var workers workerFlags
 	flags.Var(&workers, "worker", "worker endpoint as id=http://host:port (repeat at least twice)")
 	if err := flags.Parse(os.Args[1:]); err != nil {
@@ -83,10 +85,13 @@ func run() error {
 	config.Limits = protocol.DefaultLimits()
 	config.RequestTimeout = *requestTimeout
 	config.JobTimeout = *jobTimeout
+	config.RequestRetries = *requestRetries
+	config.WALPath = *walPath
 	client, err := coordinator.NewWithConfig(endpoints, &http.Client{}, config)
 	if err != nil {
 		return err
 	}
+	defer client.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	result, err := client.Run(ctx, spec)

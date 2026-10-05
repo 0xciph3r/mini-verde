@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/0xciph3r/mini-verde/internal/protocol"
+	"github.com/0xciph3r/mini-verde/internal/sandbox"
 	"github.com/0xciph3r/mini-verde/internal/worker"
 )
 
@@ -33,6 +34,9 @@ func run() error {
 	behavior := flags.String("behavior", string(worker.BehaviorHonest), "worker behavior for deterministic fault injection")
 	faultSeed := flags.Uint64("fault-seed", 0, "seed for deterministic fault injection")
 	behaviorDelay := flags.Duration("behavior-delay", 0, "delay applied by the slow behavior")
+	executionWorkers := flags.Int("execution-workers", 1, "parallel workers used for canonical execution")
+	requireSandbox := flags.Bool("require-sandbox", true, "fail startup unless an external sandbox attestation is present")
+	sandboxAttestation := flags.String("sandbox-attestation", "", "path to the supervisor-provided sandbox attestation JSON")
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		return err
 	}
@@ -42,11 +46,15 @@ func run() error {
 	if err := validateLoopbackAddress(*listenAddress); err != nil {
 		return err
 	}
+	if err := sandbox.Require(*requireSandbox, *sandboxAttestation); err != nil {
+		return err
+	}
 	config := worker.DefaultConfig()
 	config.Limits = protocol.DefaultLimits()
 	config.Behavior = worker.Behavior(*behavior)
 	config.FaultSeed = *faultSeed
 	config.Delay = *behaviorDelay
+	config.ExecutionWorkers = *executionWorkers
 	if config.Behavior == worker.BehaviorCrasher {
 		config.Crash = func() { os.Exit(70) }
 	}

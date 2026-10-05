@@ -21,6 +21,7 @@ import (
 
 	"github.com/0xciph3r/mini-verde/internal/job"
 	"github.com/0xciph3r/mini-verde/internal/protocol"
+	"github.com/0xciph3r/mini-verde/internal/wal"
 )
 
 // Status describes whether a result is accepted, rejected by objective
@@ -47,6 +48,7 @@ var (
 const (
 	DefaultRequestTimeout = 30 * time.Second
 	DefaultJobTimeout     = 2 * time.Minute
+	DefaultRequestRetries = 2
 )
 
 // Config contains coordinator-owned resource and deadline policy.
@@ -54,6 +56,9 @@ type Config struct {
 	Limits         protocol.Limits
 	RequestTimeout time.Duration
 	JobTimeout     time.Duration
+	RequestRetries int
+	WALPath        string
+	Verifier       Verifier
 }
 
 func DefaultConfig() Config {
@@ -61,6 +66,8 @@ func DefaultConfig() Config {
 		Limits:         protocol.DefaultLimits(),
 		RequestTimeout: DefaultRequestTimeout,
 		JobTimeout:     DefaultJobTimeout,
+		RequestRetries: DefaultRequestRetries,
+		Verifier:       StrictVerifier{},
 	}
 }
 
@@ -68,8 +75,8 @@ func (config Config) validate() error {
 	if err := config.Limits.Validate(); err != nil {
 		return err
 	}
-	if config.RequestTimeout <= 0 || config.JobTimeout <= 0 {
-		return fmt.Errorf("request and job timeouts must be positive")
+	if config.RequestTimeout <= 0 || config.JobTimeout <= 0 || config.RequestRetries < 0 {
+		return fmt.Errorf("request and job timeouts must be positive and retries must not be negative")
 	}
 	return nil
 }
@@ -199,6 +206,9 @@ type Coordinator struct {
 	limits         protocol.Limits
 	requestTimeout time.Duration
 	jobTimeout     time.Duration
+	requestRetries int
+	verifier       Verifier
+	journal        *wal.Log
 	attempts       atomic.Uint64
 	reputation     reputationLog
 }
@@ -238,13 +248,35 @@ func NewWithConfig(endpoints []Endpoint, client *http.Client, config Config) (*C
 	ownedClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	return &Coordinator{
+	coordinator := &Coordinator{
 		endpoints:      validated,
 		client:         &ownedClient,
 		limits:         config.Limits,
 		requestTimeout: config.RequestTimeout,
 		jobTimeout:     config.JobTimeout,
-	}, nil
+		requestRetries: config.RequestRetries,
+		verifier:       config.Verifier,
+	}
+	if coordinator.verifier == nil {
+		coordinator.verifier = StrictVerifier{}
+	}
+	if config.WALPath != "" {
+		journal, err := wal.Open(config.WALPath)
+		if err != nil {
+			return nil, err
+		}
+		coordinator.journal = journal
+	}
+	return coordinator, nil
+}
+
+// Close releases the coordinator's durable journal. It is safe to call when
+// journaling is disabled.
+func (coordinator *Coordinator) Close() error {
+	if coordinator.journal == nil {
+		return nil
+	}
+	return coordinator.journal.Close()
 }
 
 func validateEndpoint(endpoint Endpoint) (Endpoint, error) {
@@ -284,15 +316,26 @@ func (coordinator *Coordinator) Run(ctx context.Context, spec job.JobSpec) (Resu
 	if err != nil {
 		return Result{}, err
 	}
+	jobID := machine.ID()
+	if err := coordinator.recordTransition(jobID, "job/"+protocol.EncodeDigest(jobID)+"/start", "job_started", durableJobStart{Job: encodedJob}); err != nil {
+		return Result{}, fmt.Errorf("durably record job start: %w", err)
+	}
 	run := jobRun{
 		coordinator: coordinator,
 		ctx:         ctx,
 		machine:     machine,
 		encodedJob:  encodedJob,
-		jobID:       machine.ID(),
+		jobID:       jobID,
 		clock:       roundClock{next: 1},
 	}
-	return run.execute()
+	result, runErr := run.execute()
+	if runErr != nil {
+		return result, runErr
+	}
+	if err := coordinator.recordTerminalWithMachine(machine, result); err != nil {
+		return result, fmt.Errorf("durably record terminal result: %w", err)
+	}
+	return result, nil
 }
 
 func (coordinator *Coordinator) execute(
@@ -367,6 +410,16 @@ func (coordinator *Coordinator) fetchAndValidateFinalState(
 	if stateHash != wantHash {
 		return job.State{}, true, fmt.Errorf("state hash does not match agreed commitment")
 	}
+	if coordinator.verifier != nil {
+		if _, err := coordinator.verifier.Verify(ctx, machine, []Candidate{{
+			WorkerID: endpoint.ID, State: state, Hash: wantHash,
+		}}); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return job.State{}, false, err
+			}
+			return job.State{}, true, fmt.Errorf("strict verification failed: %w", err)
+		}
+	}
 	return state, false, nil
 }
 
@@ -418,6 +471,20 @@ func (coordinator *Coordinator) closeReplica(
 }
 
 func (coordinator *Coordinator) post(ctx context.Context, address string, requestValue, responseValue any) error {
+	var lastErr error
+	for attempt := 0; attempt <= coordinator.requestRetries; attempt++ {
+		lastErr = coordinator.postOnce(ctx, address, requestValue, responseValue)
+		if lastErr == nil {
+			return nil
+		}
+		if !errors.Is(lastErr, errWorkerUnavailable) || context.Cause(ctx) != nil {
+			return lastErr
+		}
+	}
+	return lastErr
+}
+
+func (coordinator *Coordinator) postOnce(ctx context.Context, address string, requestValue, responseValue any) error {
 	ctx, cancel := context.WithTimeoutCause(ctx, coordinator.requestTimeout, errRequestDeadline)
 	defer cancel()
 	payload, err := json.Marshal(requestValue)

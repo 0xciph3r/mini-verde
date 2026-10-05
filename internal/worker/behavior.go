@@ -30,15 +30,16 @@ var errInjectedCrash = errors.New("injected worker crash")
 // Config controls admission and deterministic M5 fault injection. Crash is
 // supplied by the command so the reusable worker package never calls os.Exit.
 type Config struct {
-	Limits    protocol.Limits
-	Behavior  Behavior
-	FaultSeed uint64
-	Delay     time.Duration
-	Crash     func()
+	Limits           protocol.Limits
+	Behavior         Behavior
+	FaultSeed        uint64
+	Delay            time.Duration
+	ExecutionWorkers int
+	Crash            func()
 }
 
 func DefaultConfig() Config {
-	return Config{Limits: protocol.DefaultLimits(), Behavior: BehaviorHonest}
+	return Config{Limits: protocol.DefaultLimits(), Behavior: BehaviorHonest, ExecutionWorkers: 1}
 }
 
 func (config Config) validate() error {
@@ -53,6 +54,9 @@ func (config Config) validate() error {
 	}
 	if config.Delay < 0 {
 		return fmt.Errorf("behavior delay must not be negative")
+	}
+	if config.ExecutionWorkers <= 0 {
+		return fmt.Errorf("execution workers must be positive")
 	}
 	if config.Behavior == BehaviorSlow && config.Delay == 0 {
 		return fmt.Errorf("slow behavior requires a positive delay")

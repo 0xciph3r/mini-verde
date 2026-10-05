@@ -55,18 +55,19 @@ type attempt struct {
 
 // Server is a concurrency-safe HTTP worker.
 type Server struct {
-	id             string
-	limits         protocol.Limits
-	mux            *http.ServeMux
-	jobs           chan struct{}
-	mu             sync.Mutex
-	attempts       map[attemptKey]*attempt
-	executions     atomic.Uint64
-	recomputations atomic.Uint64
-	behavior       Behavior
-	faultSeed      uint64
-	delay          time.Duration
-	crash          func()
+	id               string
+	limits           protocol.Limits
+	mux              *http.ServeMux
+	jobs             chan struct{}
+	mu               sync.Mutex
+	attempts         map[attemptKey]*attempt
+	executions       atomic.Uint64
+	recomputations   atomic.Uint64
+	behavior         Behavior
+	faultSeed        uint64
+	delay            time.Duration
+	executionWorkers int
+	crash            func()
 }
 
 func New(id string, limits protocol.Limits) (*Server, error) {
@@ -86,15 +87,16 @@ func NewWithConfig(id string, config Config) (*Server, error) {
 		return nil, err
 	}
 	server := &Server{
-		id:        id,
-		limits:    config.Limits,
-		mux:       http.NewServeMux(),
-		jobs:      make(chan struct{}, config.Limits.MaxConcurrentExecutions),
-		attempts:  make(map[attemptKey]*attempt),
-		behavior:  config.Behavior,
-		faultSeed: config.FaultSeed,
-		delay:     config.Delay,
-		crash:     config.Crash,
+		id:               id,
+		limits:           config.Limits,
+		mux:              http.NewServeMux(),
+		jobs:             make(chan struct{}, config.Limits.MaxConcurrentExecutions),
+		attempts:         make(map[attemptKey]*attempt),
+		behavior:         config.Behavior,
+		faultSeed:        config.FaultSeed,
+		delay:            config.Delay,
+		executionWorkers: config.ExecutionWorkers,
+		crash:            config.Crash,
 	}
 	server.mux.HandleFunc(protocol.ExecutePath, server.handleExecute)
 	server.mux.HandleFunc(protocol.FinalStatePath, server.handleFinalState)
@@ -338,7 +340,11 @@ func (server *Server) execute(
 		if uint64(len(hashes)) == machine.LeafCount() {
 			break
 		}
-		state, err = machine.Step(state)
+		if server.executionWorkers == 1 {
+			state, err = machine.Step(state)
+		} else {
+			state, err = machine.StepParallel(state, server.executionWorkers, job.DefaultParallelChunkSize)
+		}
 		if err != nil {
 			return protocol.ExecuteResponse{}, nil, nil, nil, nil, err
 		}
