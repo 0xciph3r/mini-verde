@@ -251,8 +251,8 @@ go vet ./...
 GOARCH=amd64 go test ./...
 ```
 
-The full design record, including numerical order, trust assumptions, and
-decision gates, is in [Mini-Verde PRD & Build Plan.md](Mini-Verde%20PRD%20%26%20Build%20Plan.md).
+The design is documented through the implementation, package tests, and
+the operational notes in [docs/operations.md](docs/operations.md).
 
 ## Security model and boundaries
 
