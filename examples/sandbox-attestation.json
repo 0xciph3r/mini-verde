@@ -1,0 +1,6 @@
+{
+  "version": "mini-verde/sandbox/v1",
+  "runtime": "gvisor",
+  "network": "coordinator-only",
+  "attested": true
+}
